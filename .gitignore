@@ -1,0 +1,31 @@
+# Build artifacts
+*.o
+*.obj
+*.d
+*.a
+*.so
+*.dylib
+*.dSYM/
+build/
+
+# Checkpoint/core-dump test artifacts
+core
+core.*
+*.core
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Private project docs/notes/tooling
+CLAUDE.md
+NOTES.md
+docs/
+.claude/
+local/

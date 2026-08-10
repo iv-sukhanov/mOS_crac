@@ -4,28 +4,22 @@
 #include <mach/mach.h>
 #include <stdatomic.h>
 #include <pthread.h>
-#include <math.h>
 #include <unistd.h>
 #include <os/os_sync_wait_on_address.h>
 #include <errno.h>
 
 #define NTHREADS 3
 
+#if defined(SEMBARR)
 typedef struct {
     semaphore_t semaphore;
     _Atomic uint32_t count;
     uint32_t thread_number;
 } barrier_sem_t;
 
-typedef struct {
-    _Atomic uint32_t gen;
-    _Atomic uint32_t count;
-    uint32_t thread_number;
-} barrier_woa_t;
-
 static barrier_sem_t barrier;
 
-int barrier_create_sem(task_t task, barrier_sem_t *barrier, uint32_t thread_number) {
+int barrier_create(task_t task, barrier_sem_t *barrier, uint32_t thread_number) {
     
     if (barrier == NULL) {
         fprintf(stderr, "a NULL barrier passed to barrier_create_sem\n");
@@ -43,7 +37,7 @@ int barrier_create_sem(task_t task, barrier_sem_t *barrier, uint32_t thread_numb
     return 0;
 }
 
-int barrier_destroy_sem(task_t task, barrier_sem_t *barrier) {
+int barrier_destroy(task_t task, barrier_sem_t *barrier) {
     kern_return_t kr = semaphore_destroy(task, barrier->semaphore);
     if (kr != KERN_SUCCESS) {
         fprintf(stderr, "failed to destroy barrier sem: %d (hex 0x%x)\n", kr, kr);
@@ -53,7 +47,7 @@ int barrier_destroy_sem(task_t task, barrier_sem_t *barrier) {
     return 0;
 }
 
-int barrier_wait_sem(barrier_sem_t *barrier) {
+int barrier_wait(barrier_sem_t *barrier) {
     
     kern_return_t kr;
     uint32_t old = atomic_fetch_add(&barrier->count, 1);
@@ -76,14 +70,26 @@ int barrier_wait_sem(barrier_sem_t *barrier) {
 
     return 0;
 }
+#else
+typedef struct {
+    _Atomic uint32_t gen;
+    _Atomic uint32_t count;
+    uint32_t thread_number;
+} barrier_woa_t;
 
-void barrier_init_woa(barrier_woa_t *barrier, uint32_t thread_number) {
+static barrier_woa_t barrier;
+
+int barrier_create(task_t task, barrier_woa_t *barrier, uint32_t thread_number) {
+    (void)task;
+    
     barrier->count = 0;
     barrier->gen = 0;
     barrier->thread_number = thread_number;
+    
+    return 0;
 }
 
-int barrier_wait_woa(barrier_woa_t *barrier) {
+int barrier_wait(barrier_woa_t *barrier) {
     uint32_t my_gen = atomic_load(&barrier->gen);
     uint32_t old = atomic_fetch_add(&barrier->count, 1);
 
@@ -94,31 +100,36 @@ int barrier_wait_woa(barrier_woa_t *barrier) {
             fprintf(stderr, "failed to wake: %d\n", errno);
             return -1;
         }
+
+        return 0;
     }
     
     while (atomic_load(&barrier->gen) == my_gen) {
-        if (os_sync_wait_on_address(&barrier->gen, my_gen, sizeof(barrier->gen), OS_SYNC_WAKE_BY_ADDRESS_NONE) != 0 &&
+        if (os_sync_wait_on_address(&barrier->gen, my_gen, sizeof(barrier->gen), OS_SYNC_WAIT_ON_ADDRESS_NONE) == -1 &&
             errno != EINTR && errno != EFAULT) 
         {
             fprintf(stderr, "failed to wait: %d\n", errno);
             return -1;
         }
     }
+
+    return 0;
 }
+#endif
 
 void* thread_fn(void* args) {
     int ind = (int)(intptr_t)args;
     
-    if (barrier_wait_sem(&barrier) != 0) {
+    if (barrier_wait(&barrier) != 0) {
         printf("error calling a barrier\n");
         return NULL;
     }
 
-    sleep(ind*2);
+    sleep(ind*3);
 
     printf("thread #%d is ready to be released\n", ind);
 
-    if (barrier_wait_sem(&barrier) != 0) {
+    if (barrier_wait(&barrier) != 0) {
         printf("error calling a barrier\n");
         return NULL;
     }
@@ -128,7 +139,7 @@ void* thread_fn(void* args) {
 }
 
 int main(void) {
-    if (barrier_create_sem(mach_task_self(), &barrier, NTHREADS + 1) == -1) {
+    if (barrier_create(mach_task_self(), &barrier, NTHREADS + 1) == -1) {
         fprintf(stderr, "cannot create a barrier");
         return -1;
     }
@@ -142,15 +153,16 @@ int main(void) {
         }
     }
     printf("created all threads, now, time to execute\n");
-    barrier_wait_sem(&barrier);
+    barrier_wait(&barrier);
 
     printf("main thread waits for the threads\n");
 
-    barrier_wait_sem(&barrier);
+    barrier_wait(&barrier);
     printf("main thread passed\n");
 
     for (int i = 0; i < NTHREADS; i++) pthread_join(threads[i], NULL);
-    barrier_destroy_sem(mach_task_self(), &barrier);
-
+#if defined(SEMBARR)
+    barrier_destroy(mach_task_self(), &barrier);
+#endif
     return 0;
 }

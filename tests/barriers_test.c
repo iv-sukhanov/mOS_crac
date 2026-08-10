@@ -8,7 +8,9 @@
 #include <os/os_sync_wait_on_address.h>
 #include <errno.h>
 
+#ifndef NTHREADS
 #define NTHREADS 3
+#endif
 
 #if defined(SEMBARR)
 typedef struct {
@@ -117,7 +119,7 @@ int barrier_wait(barrier_woa_t *barrier) {
 }
 #endif
 
-void* thread_fn(void* args) {
+void* wait_thread_fn(void* args) {
     int ind = (int)(intptr_t)args;
     
     if (barrier_wait(&barrier) != 0) {
@@ -146,7 +148,7 @@ int main(void) {
 
     pthread_t threads[NTHREADS];
     for (int i = 0; i < NTHREADS; i++) {
-        int rc = pthread_create(&threads[i], NULL, thread_fn, (void*)(intptr_t)i);
+        int rc = pthread_create(&threads[i], NULL, wait_thread_fn, (void*)(intptr_t)i);
         if (rc != 0) {
             printf("cannot create a pthread: %d\n", rc);
             return 1;

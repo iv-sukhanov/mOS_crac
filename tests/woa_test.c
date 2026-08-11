@@ -106,9 +106,11 @@ void* t2_worker_fn(void *args) {
 
 void t2_signal_action(int sig, siginfo_t *info, void *ctx) {
     (void)sig; (void)info; (void)ctx;
+    int saved_errno = errno;
     char msg[] = "  handler: delivered, calling barrier_wait (round 2) from inside the handler\n";
     write(STDOUT_FILENO, msg, sizeof(msg) - 1);
     barrier_wait(&barrier);                           /* the thing under test */
+    errno = saved_errno;
 }
 
 static int test_2(void) {

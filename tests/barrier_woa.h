@@ -21,6 +21,7 @@ static int barrier_create(barrier_woa_t *barrier, uint32_t thread_number) {
 }
 
 static int barrier_wait(barrier_woa_t *barrier) {
+    int saved_errno = errno;
     uint32_t my_gen = atomic_load(&barrier->gen);
     uint32_t old = atomic_fetch_add(&barrier->count, 1);
 
@@ -29,21 +30,25 @@ static int barrier_wait(barrier_woa_t *barrier) {
         atomic_fetch_add(&barrier->gen, 1);
         if (os_sync_wake_by_address_all(&barrier->gen, sizeof(barrier->gen), OS_SYNC_WAKE_BY_ADDRESS_NONE) != 0) {
             fprintf(stderr, "failed to wake: %d\n", errno);
+            errno = saved_errno;
             return -1;
         }
 
+        errno = saved_errno;
         return 0;
     }
-    
+
     while (atomic_load(&barrier->gen) == my_gen) {
         if (os_sync_wait_on_address(&barrier->gen, my_gen, sizeof(barrier->gen), OS_SYNC_WAIT_ON_ADDRESS_NONE) == -1 &&
-            errno != EINTR && errno != EFAULT) 
+            errno != EINTR && errno != EFAULT)
         {
             fprintf(stderr, "failed to wait: %d\n", errno);
+            errno = saved_errno;
             return -1;
         }
     }
 
+    errno = saved_errno;
     return 0;
 }
 

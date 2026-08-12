@@ -7,6 +7,8 @@
 #include <sys/mman.h>
 #include <stdio.h>
 #include <string.h>
+#include <pthread.h>
+#include <dlfcn.h>
 #include <unistd.h>
 
 static void dump_region(const char *label, mach_vm_address_t addr, natural_t depth_in) {
@@ -45,44 +47,98 @@ static uint64_t find_any_submap() {
         }
         if (info.is_submap == 1) {
             printf("fond a submap region at addr=0x%llx size=0x%llx\n", a, size);
-            return a + size / 2;
+            
+            natural_t submap_depth = 32;
+            vm_region_submap_info_data_64_t submap_info;
+            mach_msg_type_number_t submap_count = VM_REGION_SUBMAP_INFO_COUNT_64;
+    
+            kern_return_t kr = mach_vm_region_recurse(mach_task_self(), &a, &size, &submap_depth, 
+                                                    (vm_region_recurse_info_t)&submap_info, &submap_count);
+
+            if (kr != KERN_SUCCESS) {
+                printf("failed to descend into the submap region: %d\n", kr);
+                return 0;
+            }
+            printf("descended into the submap region at addr=0x%llx size=0x%llx\n", a, size);
+            return a;
         }
         a += size;
     }
+}
+
+static uint64_t get_func_address(long page_size) {
+    void* fn = (void*)pthread_key_delete;
+    void* mmap_addr = (void*)mmap;
+    uint64_t mask = ~(page_size - 1);
+    
+    Dl_info info;
+    if (dladdr((void*)fn, &info)) {
+        printf("function resolved to %s (base %p)\n", info.dli_fname, info.dli_fbase);
+    } else {
+        printf("couldn't resolve the path\n");
+        return 1;
+    }
+
+    uint64_t fn_page = (uint64_t)(intptr_t)fn & mask;
+    uint64_t mmap_page = (uint64_t)(intptr_t)mmap_addr & mask;
+    printf("function page: 0x%llx, mmap page: 0x%llx\n", fn_page, mmap_page);
+    if (fn_page == mmap_page) {
+        printf("same page for function and mmap\n");
+        return 1;
+    }
+
+    return (uint64_t)(intptr_t)fn & ~(uint64_t)(page_size - 1);
 }
 
 int main(void) {
     long pagesize = sysconf(_SC_PAGESIZE);
     printf("pagesize: %ld\n", pagesize);
 
-    mach_vm_address_t submap_address = find_any_submap();
-    if (submap_address == 0) {
-        printf("didn't find any submaps\n");
-        return 1;
-    }
+    // mach_vm_address_t submap_address = find_any_submap();
+    // if (submap_address == 0) {
+    //     printf("didn't find any submaps\n");
+    //     return 1;
+    // }
 
     /* depth=0: don't descend at all -- if a submap is right here, this
      * reports the submap boundary itself (is_submap=1), not its flattened
      * leaf content. This is the "is it really a submap" check. */
-    dump_region("before, depth=0 (raw submap check)", submap_address, 0);
-    dump_region("before, depth=32 (fully descended)", submap_address, 32);
+    // dump_region("before, depth=0 (raw submap check)", submap_address, 0);
+    // dump_region("before, depth=32 (fully descended)", submap_address, 32);
 
-    printf("\nattempting mmap(MAP_FIXED) over the submap's start address...\n");
-    void *got = mmap((void *)submap_address, (size_t)pagesize, PROT_READ | PROT_WRITE,
-                      MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
-    if (got == MAP_FAILED) {
-        perror("mmap");
-        printf("RESULT: mmap(MAP_FIXED) over a submap FAILED -- kernel protects it\n");
-        return 0;
-    }
-    printf("mmap returned %p (%s)\n", got, got == (void *)submap_address ? "matches requested address" : "MISMATCH");
-    printf("RESULT: mmap(MAP_FIXED) over a submap SUCCEEDED\n\n");
+    // printf("\nattempting mmap(MAP_FIXED) over the submap's start address...\n");
+    // void *got = mmap((void *)submap_address, (size_t)pagesize, PROT_READ | PROT_WRITE,
+    //                   MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
+    // if (got == MAP_FAILED) {
+    //     perror("mmap");
+    //     printf("RESULT: mmap(MAP_FIXED) over a submap FAILED -- kernel protects it\n");
+    //     return 0;
+    // }
+    // printf("mmap returned %p (%s)\n", got, got == (void *)submap_address ? "matches requested address" : "MISMATCH");
+    // printf("RESULT: mmap(MAP_FIXED) over a submap SUCCEEDED\n\n");
 
     /* minimal work after the override -- avoid calling into anything that
      * might route through the page we just clobbered (see the "this could
      * crash the process" caveat flagged before running this). */
-    dump_region("after override, depth=0 (raw submap check)", submap_address, 0);
-    dump_region("after override, depth=32 (fully descended)", submap_address, 32);
+    // dump_region("after override, depth=0 (raw submap check)", submap_address, 0);
+    // dump_region("after override, depth=32 (fully descended)", submap_address, 32);
+
+    printf("================\n");
+
+    mach_vm_address_t real_cache_addr = get_func_address(pagesize);
+    dump_region("function page addr before overrite, depth=0 (raw submap check)", real_cache_addr, 0);
+    dump_region("function page addr after, depth=32 (fully descended)", real_cache_addr, 32);
+
+    void *got = mmap((void*)(real_cache_addr), (size_t)pagesize, PROT_READ | PROT_WRITE,
+                MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (got == MAP_FAILED) {
+        perror("mmap");
+        printf("RESULT: mmap(MAP_FIXED) over a function submap FAILED -- kernel protects it\n");
+        return 0;
+    }
+
+    printf("mmap returned %p (%s)\n", got, got == (void*)real_cache_addr ? "matches the original" : "MISMATCH");
+    printf("RESULT: mmap(MAP_FIXED) over a function submap SUCCEEDED\n\n");
 
     return 0;
 }

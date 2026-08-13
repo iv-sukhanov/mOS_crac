@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <unistd.h>
 
 #define ITERN 9
@@ -73,6 +74,29 @@ static void* worker_state_set_fn(void* arg) {
     return NULL;
 }
 
+// Minimal probe for modes A/B: what is TPIDR_EL0 on a freshly created raw
+// Mach thread, before anything pthread-related has touched it? Deliberately
+// avoids printf/snprintf (the exact kind of call this whole investigation
+// found crashing) — hand-rolled hex + one raw write() syscall instead, so
+// the probe can't crash on the very thing it's trying to observe.
+static void tls_probe_fn(void) {
+    uint64_t tpidr;
+    __asm__ volatile ("mrs %0, tpidr_el0" : "=r" (tpidr));
+
+    char buf[64];
+    int n = 0;
+    const char prefix[] = "raw Mach thread's tpidr_el0 = 0x";
+    for (int i = 0; prefix[i]; i++) buf[n++] = prefix[i];
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        int nibble = (tpidr >> shift) & 0xF;
+        buf[n++] = nibble < 10 ? (char)('0' + nibble) : (char)('a' + nibble - 10);
+    }
+    buf[n++] = '\n';
+    write(STDOUT_FILENO, buf, n);
+
+    for (;;) pause(); // no valid caller frame to return into — never let this fall off the end
+}
+
 void action_usr1_fn(int sig, siginfo_t* info, void* ctx) {
     arm_thread_state64_t state = ((ucontext_t*)ctx)->uc_mcontext->__ss;
     regs.pc = (uint64_t)arm_thread_state64_get_pc(state);
@@ -129,6 +153,10 @@ int main(int argc, char** argv) {
     } else if (argc > 1 && strcmp(argv[1], "c") == 0) {
         mode = 2;
     }
+    // `<a|b> probe`: skip the normal resume-the-loop behavior and instead
+    // point the seeded thread at tls_probe_fn — only meaningful for modes
+    // A/B, where TLS is never explicitly seeded at all (see comments below).
+    bool probe = argc > 2 && strcmp(argv[2], "probe") == 0;
 
     setvbuf(stdout, NULL, _IONBF, 0); // unbuffered — a crash mid-run must not eat prior output
     printf("Running in mode %s\n.\n", mode == 0 ? "a" : mode == 1 ? "b" : "c");
@@ -175,6 +203,12 @@ int main(int argc, char** argv) {
     state.__pc = regs.pc;
     state.__pad = regs.pad;
     memcpy(state.__x, regs.x, sizeof(regs.x));
+    if (probe) {
+        // Only PC changes — SP stays the captured worker's real, valid
+        // stack (already proven reusable by modes A/B themselves), just
+        // pointed at a function that never touches pthread machinery.
+        state.__pc = (uint64_t)tls_probe_fn;
+    }
 
     if (mode == 0) {
         thread_act_t child = MACH_PORT_NULL;
@@ -192,16 +226,23 @@ int main(int argc, char** argv) {
         // ponytail: the thread is already running by the time this second
         // call lands, so there's a real (if short) window where it executes
         // with default/zero NEON state — thread_create_running only takes
-        // one flavor at creation. Upgrade path: point the seeded PC at a
-        // trampoline stub that self-seeds NEON+TLS as its first instructions
-        // (the shape mode C gets for free via the signal handler).
+        // one flavor at creation.
         kr = thread_set_state(child, ARM_NEON_STATE64, (thread_state_t)&regs.neon, ARM_NEON_STATE64_COUNT);
         if (kr != KERN_SUCCESS) {
             fprintf(stderr, "thread_set_state(NEON) failed: %d\n", kr);
         }
-        // Same TLS gap as mode B below — no public Mach flavor to seed
-        // TPIDR_EL0 remotely; left unset, tpidr=... in the loop's own print
-        // makes the gap directly observable instead of silent.
+        // Same TLS gap as mode B below, and NOT a "just add a trampoline"
+        // fix — confirmed 2026-08-13: a raw Mach thread crashes on
+        // pthread_self(), on plain printf (stdio's own TLS-backed state),
+        // and on ordinary thread-exit cleanup, not just on calls that touch
+        // TPIDR_EL0 explicitly. A trampoline could set the register itself,
+        // but every one of those crashes dereferences *through* it expecting
+        // a fully-initialized struct pthread (guard pages, TSD/destructor
+        // table, cleanup stack, ...) — private libpthread ABI, undocumented,
+        // not stable across OS versions. Replicating that is a bigger, more
+        // fragile lift than just calling pthread_create() — i.e. mode C.
+        // Left unset here; tpidr=... in the loop's own print makes the gap
+        // directly observable instead of silent.
         mach_port_deallocate(mach_task_self(), child);
     } else if (mode == 1) {
         mach_port_t new_thread;
@@ -242,6 +283,14 @@ int main(int argc, char** argv) {
             return -1;
         }
         pthread_detach(worker_state_set_thread);
+    }
+
+    if (probe) {
+        // tls_probe_fn parks itself forever after printing — nothing will
+        // ever set `done`, so don't wait on it. Just give the probe time to
+        // run and print, then exit.
+        usleep(500000);
+        return 0;
     }
 
     if (wait_for_flag(&done, 5000) == -1) {

@@ -8,7 +8,7 @@ CKPT_FILE ?= /tmp/ckpt.bin
 $(BINDIR)/%: %.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-.PHONY: checkpoint restore run clean
+.PHONY: checkpoint restore run clean sweep-pc-page
 
 checkpoint: $(BINDIR)/sim_checkpoint_test
 	$(BINDIR)/sim_checkpoint_test checkpoint $(CKPT_FILE)
@@ -16,7 +16,18 @@ checkpoint: $(BINDIR)/sim_checkpoint_test
 restore: $(BINDIR)/sim_checkpoint_test
 	$(BINDIR)/sim_checkpoint_test restore $(CKPT_FILE)
 
+checkpoint-pc-page: $(BINDIR)/code_alloc_test
+	$(BINDIR)/code_alloc_test checkpoint $(CKPT_FILE)
+
+map-pc-page: $(BINDIR)/code_alloc_test
+	$(BINDIR)/code_alloc_test restore $(CKPT_FILE)
+
 run: checkpoint restore
+
+run-pc-page: checkpoint-pc-page map-pc-page
+
+sweep-pc-page: $(BINDIR)/code_alloc_test
+	$(BINDIR)/code_alloc_test sweep
 
 clean:
 	rm -f $(CKPT_FILE)

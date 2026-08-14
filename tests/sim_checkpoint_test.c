@@ -338,6 +338,7 @@ static int do_restore(const char* path) {
      * (some collisions replaced fine, some "clean" targets still failed
      * with ENOMEM). munmap() on unmapped memory is a harmless no-op either
      * way (same as minicriu's own comment notes). */
+    printf("allocating stack/code chunks at their original addresses... size=%llu\n", (unsigned long long)hdr.stack_len);
     munmap((void*)(uintptr_t)hdr.stack_addr, hdr.stack_len);
     void* got_stack = mmap((void*)(uintptr_t)hdr.stack_addr, hdr.stack_len, PROT_READ | PROT_WRITE,
                             MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
@@ -357,6 +358,8 @@ static int do_restore(const char* path) {
     }
     printf("  DIAG post-munmap re-check: code %s\n",
            range_is_free(hdr.code_addr, hdr.code_len) ? "clean" : "STILL COLLIDING");
+
+    printf("allocating code chunk at its original address... size=%llu\n", (unsigned long long)hdr.code_len);
     void* got_code = mmap((void*)(uintptr_t)hdr.code_addr, hdr.code_len, PROT_READ | PROT_WRITE,
                            MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
     if (got_code == MAP_FAILED) { perror("mmap code"); return 1; }

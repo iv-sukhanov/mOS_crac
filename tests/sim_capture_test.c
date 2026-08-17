@@ -91,7 +91,6 @@ static void* worker_fn(void* arg) {
         counter++;
         if (counter == WORKER_ITERS) {
             write(STDOUT_FILENO, msg, sizeof(msg) - 1);
-            printf("the hits counter is %d, addr=0x%llx\n", hits, (uint64_t)(uintptr_t)&hits);
             counter = 0;
             hits++;
         }
@@ -124,7 +123,7 @@ static int do_checkpoint(const char* path) {
     if (pthread_create(&worker, NULL, worker_fn, NULL) != 0) { perror("pthread_create"); return 1; }
 
     barrier_wait(&g_barrier);
-    usleep(500);
+    usleep(150000);
 
     if (pthread_kill(worker, SIGUSR1) != 0) { perror("pthread_kill"); return 1; }
 
@@ -153,7 +152,6 @@ static int do_checkpoint(const char* path) {
     printf("  pc=0x%llx sp=0x%llx\n",
            g_regs.gregs.__pc, g_regs.gregs.__sp);
     
-    usleep(200000);
     pthread_detach(worker); /* let it run to completion on its own; we no longer need it */
     
     return 0;

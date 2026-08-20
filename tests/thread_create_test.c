@@ -24,6 +24,35 @@ static _Atomic uint32_t counter;
 static atomic_bool captured = false;
 static atomic_bool done = false;
 
+/* EXPERIMENT (2026-08-17, docs/006 step 1): mode B leaves TPIDR_EL0 unset
+ * because there's no thread_set_state flavor for it -- it's not part of
+ * ARM_THREAD_STATE64/ARM_NEON_STATE64, only settable via `msr` from the
+ * thread itself (exactly why mode C sets it inside its own signal
+ * handler). This trampoline is the "from the thread itself" step for a
+ * raw thread_create'd thread: seed TPIDR_EL0 from tls_seed_data, then
+ * jump to the real captured PC. Uses only x16/x17 (ARM64 ABI's
+ * linker-scratch registers, IP0/IP1 -- never expected to hold a live
+ * value across normal compiled code) so the real captured x0-x15/x18-x30
+ * state (set via thread_set_state before this ever runs) stays completely
+ * undisturbed for the resumed worker_fn body. Different in kind from the
+ * trampoline 2026-08-13 ruled out for modes A/B: that one needed to
+ * *fabricate* a valid struct pthread to point at; this one only needs to
+ * *point at* one that's still genuinely alive (the original captured
+ * thread is parked in action_usr1_fn, not destroyed). */
+static uint64_t tls_seed_data[2]; /* [0]=tpidr value, [1]=target pc */
+
+extern void tls_seed_trampoline(void);
+__asm__(
+    ".global _tls_seed_trampoline\n"
+    "_tls_seed_trampoline:\n"
+    "  adrp x16, _tls_seed_data@PAGE\n"
+    "  add  x16, x16, _tls_seed_data@PAGEOFF\n"
+    "  ldr  x17, [x16]\n"
+    "  msr  tpidr_el0, x17\n"
+    "  ldr  x16, [x16, #8]\n"
+    "  br   x16\n"
+);
+
 static double elapsed_ms(struct timespec* start) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -152,6 +181,8 @@ int main(int argc, char** argv) {
         mode = 1;
     } else if (argc > 1 && strcmp(argv[1], "c") == 0) {
         mode = 2;
+    } else if (argc > 1 && strcmp(argv[1], "b-tls") == 0) {
+        mode = 3; // mode B, but seeded via tls_seed_trampoline -- 2026-08-17 experiment
     }
     // `<a|b> probe`: skip the normal resume-the-loop behavior and instead
     // point the seeded thread at tls_probe_fn — only meaningful for modes
@@ -159,7 +190,7 @@ int main(int argc, char** argv) {
     bool probe = argc > 2 && strcmp(argv[2], "probe") == 0;
 
     setvbuf(stdout, NULL, _IONBF, 0); // unbuffered — a crash mid-run must not eat prior output
-    printf("Running in mode %s\n.\n", mode == 0 ? "a" : mode == 1 ? "b" : "c");
+    printf("Running in mode %s\n.\n", mode == 0 ? "a" : mode == 1 ? "b" : mode == 3 ? "b-tls" : "c");
 
     pthread_t worker_thread;
     atomic_init(&counter, 0);
@@ -208,6 +239,18 @@ int main(int argc, char** argv) {
         // stack (already proven reusable by modes A/B themselves), just
         // pointed at a function that never touches pthread machinery.
         state.__pc = (uint64_t)tls_probe_fn;
+    }
+    if (mode == 3) {
+        // Same idea as `probe`: change PC, not LR -- thread_set_state
+        // doesn't "call into" the new thread the way bl/blr would (the
+        // only case where LR, the return address register, matters). The
+        // new thread's first fetched instruction just *is* whatever __pc
+        // holds; there's no call/return relationship to route through.
+        // tls_seed_data feeds the trampoline the real tpidr + the real
+        // target PC it'll jump to once TPIDR_EL0 is set.
+        tls_seed_data[0] = regs.tpidr;
+        tls_seed_data[1] = regs.pc;
+        state.__pc = (uint64_t)tls_seed_trampoline;
     }
 
     if (mode == 0) {
@@ -265,6 +308,39 @@ int main(int argc, char** argv) {
 
         // Thread is still suspended here, so unlike mode A this seeds NEON
         // race-free — nothing can run with the wrong state before resume.
+        kr = thread_set_state(new_thread, ARM_NEON_STATE64, (thread_state_t)&regs.neon, ARM_NEON_STATE64_COUNT);
+        if (kr != KERN_SUCCESS) {
+            fprintf(stderr, "thread_set_state(NEON) failed: %d\n", kr);
+        }
+
+        kr = thread_resume(new_thread);
+        if (kr != KERN_SUCCESS) {
+            fprintf(stderr, "thread_resume failed: %d\n", kr);
+            return -1;
+        }
+        mach_port_deallocate(mach_task_self(), new_thread);
+    } else if (mode == 3) {
+        // Identical to mode B's own thread_create/thread_set_state/resume
+        // sequence -- the only difference is state.__pc already points at
+        // tls_seed_trampoline (set above) instead of the real captured PC.
+        mach_port_t new_thread;
+        kr = thread_create(mach_task_self(), &new_thread);
+        if (kr != KERN_SUCCESS) {
+            fprintf(stderr, "thread_create failed: %d\n", kr);
+            return -1;
+        }
+
+        kr = thread_set_state(
+            new_thread,
+            ARM_THREAD_STATE64,
+            (thread_state_t)&state,
+            ARM_THREAD_STATE64_COUNT
+        );
+        if (kr != KERN_SUCCESS) {
+            fprintf(stderr, "thread_set_state failed: %d\n", kr);
+            return -1;
+        }
+
         kr = thread_set_state(new_thread, ARM_NEON_STATE64, (thread_state_t)&regs.neon, ARM_NEON_STATE64_COUNT);
         if (kr != KERN_SUCCESS) {
             fprintf(stderr, "thread_set_state(NEON) failed: %d\n", kr);

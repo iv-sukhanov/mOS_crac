@@ -1,6 +1,8 @@
 #include <signal.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <string.h>
+#include <errno.h>
 #include <sys/mman.h>
 #include <mach/thread_state.h>
 #include <mach/mach_vm.h>
@@ -43,6 +45,70 @@ static uint64_t floor_to_page(uint64_t addr) {
 static void* hijack_fn(void* arg) {
     (void)arg;
     raise(SIGUSR1);
+    return NULL;
+}
+
+/* EXPERIMENT (2026-08-17): plain munmap() and mach_vm_deallocate() both
+ * leave this range's MALLOC guard page stuck (2026-08-14/17 findings) --
+ * before concluding no VM call can touch it, try every other plausible
+ * primitive: the two more direct allocate/map entry points MAP_FIXED's
+ * BSD mmap() wrapper sits on top of (in case that wrapper layer, not
+ * vm_map itself, is what refuses), mprotect-then-retry (maybe a live
+ * PROT_NONE region behaves differently once it's no longer guard-shaped),
+ * and mach_vm_write directly against the untouched region (in case a
+ * cross-task memory-write RPC bypasses protection checks the way ptrace
+ * writes do on other OSes). Stops at the first one that actually leaves
+ * real RW memory mapped at `addr`; returns a label for whichever worked,
+ * or NULL if none did. */
+static const char* try_reclaim_stuck_range(uint64_t addr, uint64_t len) {
+    mach_vm_address_t a;
+    kern_return_t kr;
+
+    a = addr;
+    kr = mach_vm_allocate(mach_task_self(), &a, len, VM_FLAGS_FIXED);
+    fprintf(stderr, "  try mach_vm_allocate(FIXED): kr=%d\n", kr);
+    if (kr == KERN_SUCCESS) return "mach_vm_allocate(VM_FLAGS_FIXED)";
+    munmap((void*)(uintptr_t)addr, len);
+
+    a = addr;
+    kr = mach_vm_allocate(mach_task_self(), &a, len, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE);
+    fprintf(stderr, "  try mach_vm_allocate(FIXED|OVERWRITE): kr=%d\n", kr);
+    if (kr == KERN_SUCCESS) return "mach_vm_allocate(VM_FLAGS_FIXED|VM_FLAGS_OVERWRITE)";
+    munmap((void*)(uintptr_t)addr, len);
+
+    a = addr;
+    kr = mach_vm_map(mach_task_self(), &a, len, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                      MACH_PORT_NULL, 0, FALSE,
+                      VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE,
+                      VM_INHERIT_DEFAULT);
+    fprintf(stderr, "  try mach_vm_map(FIXED|OVERWRITE): kr=%d\n", kr);
+    if (kr == KERN_SUCCESS) return "mach_vm_map(VM_FLAGS_FIXED|VM_FLAGS_OVERWRITE)";
+    munmap((void*)(uintptr_t)addr, len);
+
+    /* mach_vm_write against the region exactly as-is -- no mprotect first,
+     * testing whether the RPC itself ignores current protection. */
+    uint8_t probe_bytes[16] = {0};
+    kr = mach_vm_write(mach_task_self(), addr, (vm_offset_t)probe_bytes, sizeof(probe_bytes));
+    fprintf(stderr, "  try mach_vm_write (no mprotect first): kr=%d\n", kr);
+    if (kr == KERN_SUCCESS) return "mach_vm_write (bypassing protection)";
+
+    /* mprotect to RW, then retry the plain mmap(MAP_FIXED) that started
+     * this whole diagnostic, and mach_vm_write again if that still fails. */
+    int mp = mprotect((void*)(uintptr_t)addr, len, PROT_READ | PROT_WRITE);
+    fprintf(stderr, "  try mprotect(RW) first: rc=%d errno=%d (%s)\n",
+            mp, mp == 0 ? 0 : errno, mp == 0 ? "ok" : strerror(errno));
+    if (mp == 0) {
+        void* got = mmap((void*)(uintptr_t)addr, len, PROT_READ | PROT_WRITE,
+                          MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
+        fprintf(stderr, "  try mmap(MAP_FIXED) after mprotect(RW): %s\n",
+                got == MAP_FAILED ? strerror(errno) : "ok");
+        if (got != MAP_FAILED) return "mprotect(RW) then mmap(MAP_FIXED)";
+
+        kr = mach_vm_write(mach_task_self(), addr, (vm_offset_t)probe_bytes, sizeof(probe_bytes));
+        fprintf(stderr, "  try mach_vm_write after mprotect(RW): kr=%d\n", kr);
+        if (kr == KERN_SUCCESS) return "mprotect(RW) then mach_vm_write";
+    }
+
     return NULL;
 }
 
@@ -124,16 +190,25 @@ static int do_restore(const char* path) {
            hdr.stack_checksum, restored_checksum,
            hdr.stack_checksum == restored_checksum ? "MATCH" : "MISMATCH");
 
-    if (munmap((void*)(uintptr_t)hdr.code_addr, hdr.code_len) != 0) {
-        perror("  DIAG munmap code");
-    }
-    printf("  DIAG post-munmap re-check: code %s\n",
-           range_is_free(hdr.code_addr, hdr.code_len) ? "clean" : "STILL COLLIDING");
-
     printf("allocating code chunk at its original address... size=%llu\n", hdr.code_len);
     void* got_code = mmap((void*)(uintptr_t)hdr.code_addr, hdr.code_len, PROT_READ | PROT_WRITE,
                            MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
-    if (got_code == MAP_FAILED) { perror("mmap code"); return 1; }
+    if (got_code == MAP_FAILED) {
+        perror("mmap code");
+        /* mach_vm_deallocate already conclusively tested 2026-08-17 (13/13
+         * failed) -- not repeated here. Try everything else instead. */
+        const char* worked = try_reclaim_stuck_range(hdr.code_addr, hdr.code_len);
+        if (worked) {
+            printf("  RECLAIMED via: %s\n", worked);
+            got_code = (void*)(uintptr_t)hdr.code_addr;
+        } else {
+            printf("  PAUSED for inspection: pid=%d target=[0x%llx,0x%llx]\n"
+                   "  run: vmmap -noCoalesce -interleaved %d\n",
+                   getpid(), hdr.code_addr, hdr.code_addr + hdr.code_len, getpid());
+            pause(); /* attach vmmap, then kill this process when done */
+            return 1;
+        }
+    }
     if ((uint64_t)(uintptr_t)got_code != hdr.code_addr) {
         fprintf(stderr, "MAP_FIXED did not honor the code address\n"); return 1;
     } else {

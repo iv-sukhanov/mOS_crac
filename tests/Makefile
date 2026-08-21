@@ -8,7 +8,7 @@ CKPT_FILE ?= /tmp/ckpt.bin
 $(BINDIR)/%: %.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello resume-noaslr-retry run-noaslr-retry
+.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello resume-noaslr-retry run-noaslr-retry full-capture
 
 checkpoint: $(BINDIR)/sim_checkpoint_test
 	$(BINDIR)/sim_checkpoint_test checkpoint $(CKPT_FILE)
@@ -66,6 +66,12 @@ freestanding-hello: freestanding_hello.s strip_lc_load_dylib.py
 	python3 strip_lc_load_dylib.py $(BINDIR)/freestanding_hello
 	codesign -s - -f $(BINDIR)/freestanding_hello
 	$(BINDIR)/freestanding_hello
+
+# Whole-process capture, single-threaded target (docs/006 "Part 1"). Runs
+# in the foreground and keeps going after the checkpoint is written -- Ctrl-C
+# to stop it once you've seen the self-check pass.
+full-capture: $(BINDIR)/full_capture_test
+	$(BINDIR)/full_capture_test $(CKPT_FILE)
 
 clean:
 	rm -f $(CKPT_FILE)

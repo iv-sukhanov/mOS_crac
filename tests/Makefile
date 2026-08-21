@@ -8,7 +8,7 @@ CKPT_FILE ?= /tmp/ckpt.bin
 $(BINDIR)/%: %.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello
+.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello resume-noaslr-retry run-noaslr-retry
 
 checkpoint: $(BINDIR)/sim_checkpoint_test
 	$(BINDIR)/sim_checkpoint_test checkpoint $(CKPT_FILE)
@@ -29,6 +29,15 @@ resume-noaslr: $(BINDIR)/sim_noaslr_restore_test $(BINDIR)/spawn_noaslr
 	$(BINDIR)/spawn_noaslr $(BINDIR)/sim_noaslr_restore_test $(CKPT_FILE)
 
 run-noaslr: capture resume-noaslr
+
+# Same as resume-noaslr, but retries (each in a fresh process) up to
+# MOS_CRAC_RETRIES times whenever the restore hits the unreclaimable
+# MALLOC-guard-page collision -- see NOTES.md 2026-08-21 / spawn_noaslr.c.
+MOS_CRAC_RETRIES ?= 10
+resume-noaslr-retry: $(BINDIR)/sim_noaslr_restore_test $(BINDIR)/spawn_noaslr
+	$(BINDIR)/spawn_noaslr -r $(MOS_CRAC_RETRIES) $(BINDIR)/sim_noaslr_restore_test $(CKPT_FILE)
+
+run-noaslr-retry: capture resume-noaslr-retry
 
 checkpoint-pc-page: $(BINDIR)/code_alloc_test
 	$(BINDIR)/code_alloc_test checkpoint $(CKPT_FILE)

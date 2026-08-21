@@ -13,10 +13,30 @@
  * os_sync_wait_on_address over __ulock_wait elsewhere in this project:
  * could change or vanish across an OS update without notice. Revisit if it
  * ever does.
+ *
+ * `-r <n>` (2026-08-21): retry up to n times, in a fresh process each time,
+ * whenever the child exits EX_TEMPFAIL -- the code
+ * sim_noaslr_restore_test.c's map_fixed_or_retry() uses to mean "this
+ * launch's malloc-guard-page layout collided with the restore target, try
+ * a different one" (see NOTES.md 2026-08-21/2026-08-17: that collision is
+ * unfixable within one process, but its placement is randomized per launch,
+ * so a fresh process is a fresh roll).
+ *
+ * IMPORTANT, found the hard way (NOTES.md 2026-08-21): `-r` does NOT combine
+ * with disabling ASLR. Verified directly -- 6/6 identical collide/clean
+ * outcome across independent ASLR-disabled launches against the same
+ * checkpoint file. `_POSIX_SPAWN_DISABLE_ASLR` doesn't just fix the kernel's
+ * image slide, it fixes the *whole* process layout, malloc's own
+ * guard-page placement included, so every relaunch is the exact same roll
+ * -- retrying buys nothing. So: `-r` (n>1) leaves ASLR on (real per-launch
+ * variability, which retry actually needs); omitting -r (n=1, the default)
+ * keeps the original single-shot ASLR-disabled behavior exactly.
  */
 #include <spawn.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sysexits.h>
 #include <sys/wait.h>
 
 #ifndef _POSIX_SPAWN_DISABLE_ASLR
@@ -26,25 +46,52 @@
 extern char **environ;
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "usage: %s <path> [args...]\n", argv[0]);
+    int argi = 1;
+    int max_attempts = 1;
+    if (argi < argc && strcmp(argv[argi], "-r") == 0) {
+        if (argi + 1 >= argc) { fprintf(stderr, "-r needs an attempt count\n"); return 2; }
+        max_attempts = atoi(argv[argi + 1]);
+        if (max_attempts < 1) { fprintf(stderr, "-r attempt count must be >= 1\n"); return 2; }
+        argi += 2;
+    }
+    if (argi >= argc) {
+        fprintf(stderr, "usage: %s [-r max_attempts] <path> [args...]\n", argv[0]);
         return 2;
     }
 
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
-    posix_spawnattr_setflags(&attr, _POSIX_SPAWN_DISABLE_ASLR);
-
-    pid_t pid;
-    int rc = posix_spawn(&pid, argv[1], NULL, &attr, &argv[1], environ);
-    posix_spawnattr_destroy(&attr);
-    if (rc != 0) {
-        fprintf(stderr, "posix_spawn failed: %s\n", strerror(rc));
-        return 1;
+    if (max_attempts == 1) {
+        /* Single-shot: original deterministic-layout behavior, unchanged. */
+        posix_spawnattr_setflags(&attr, _POSIX_SPAWN_DISABLE_ASLR);
     }
+    /* max_attempts > 1: leave ASLR on -- see the top-of-file note on why
+     * retry and disabled-ASLR don't combine. */
 
-    int status;
-    if (waitpid(pid, &status, 0) == -1) { perror("waitpid"); return 1; }
+    int status = 0;
+    for (int attempt = 1; attempt <= max_attempts; attempt++) {
+        pid_t pid;
+        int rc = posix_spawn(&pid, argv[argi], NULL, &attr, &argv[argi], environ);
+        if (rc != 0) {
+            fprintf(stderr, "posix_spawn failed: %s\n", strerror(rc));
+            posix_spawnattr_destroy(&attr);
+            return 1;
+        }
+        if (waitpid(pid, &status, 0) == -1) {
+            perror("waitpid");
+            posix_spawnattr_destroy(&attr);
+            return 1;
+        }
+
+        if (WIFEXITED(status) && WEXITSTATUS(status) == EX_TEMPFAIL && attempt < max_attempts) {
+            fprintf(stderr, "attempt %d/%d: collided (EX_TEMPFAIL), retrying in a fresh process...\n",
+                    attempt, max_attempts);
+            continue;
+        }
+        break; /* success, a real failure, signal death, or attempts exhausted */
+    }
+    posix_spawnattr_destroy(&attr);
+
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) { fprintf(stderr, "child killed by signal %d\n", WTERMSIG(status)); return 128 + WTERMSIG(status); }
     return 1;

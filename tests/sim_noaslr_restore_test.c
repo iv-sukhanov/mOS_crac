@@ -1,8 +1,10 @@
 #include <signal.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <sysexits.h>
 #include <sys/mman.h>
 #include <mach/thread_state.h>
 #include <mach/mach_vm.h>
@@ -139,6 +141,51 @@ static bool range_is_free(uint64_t start, uint64_t len) {
     return true;
 }
 
+/* mmap(MAP_FIXED) at `addr`, with the MALLOC-guard-page collision (2026-08-14
+ * onward) handled instead of left to the caller. `try_reclaim_stuck_range()`
+ * is tried first on the off chance this particular collision is reclaimable
+ * (2026-08-17: none tested ever were, but cheap to keep trying). If that
+ * fails too, this exits the whole process with EX_TEMPFAIL ("temporary
+ * failure, retry" -- sysexits.h) rather than returning an error: a collision
+ * here isn't this process's bug, it's this *launch's* malloc-metadata layout
+ * being unlucky, and the only known fix is a fresh process with a fresh
+ * layout (see NOTES.md 2026-08-21). `spawn_noaslr -r <n>` is the retry
+ * wrapper that acts on this exit code. Only ENOMEM is treated as that known,
+ * retryable collision signature -- any other errno is a real bug and exits
+ * 1 instead, so a genuine problem doesn't just get silently retried forever.
+ * Set MOS_CRAC_PAUSE_ON_COLLISION=1 to get the old manual-vmmap-inspection
+ * behavior instead of exiting, for one-off debugging. */
+static void* map_fixed_or_retry(uint64_t addr, uint64_t len, const char* label) {
+    void* got = mmap((void*)(uintptr_t)addr, len, PROT_READ | PROT_WRITE,
+                      MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (got != MAP_FAILED) return got;
+
+    int saved_errno = errno;
+    fprintf(stderr, "mmap %s: %s\n", label, strerror(saved_errno));
+    if (saved_errno != ENOMEM) {
+        fprintf(stderr, "  errno isn't the known MALLOC-guard-page collision "
+                "signature -- treating as a real bug, not retrying\n");
+        exit(1);
+    }
+
+    const char* worked = try_reclaim_stuck_range(addr, len);
+    if (worked) {
+        printf("  RECLAIMED via: %s\n", worked);
+        return (void*)(uintptr_t)addr;
+    }
+
+    if (getenv("MOS_CRAC_PAUSE_ON_COLLISION")) {
+        printf("  PAUSED for inspection: pid=%d target=[0x%llx,0x%llx]\n"
+               "  run: vmmap -noCoalesce -interleaved %d\n",
+               getpid(), addr, addr + len, getpid());
+        pause();
+    }
+
+    fprintf(stderr, "  %s collided with an unreclaimable region -- exiting "
+            "EX_TEMPFAIL so a retry wrapper can try a fresh process\n", label);
+    exit(EX_TEMPFAIL);
+}
+
 void restore_state(int sig, siginfo_t* info, void* ctx) {
     (void)sig; (void)info;
     ((ucontext_t*)ctx)->uc_mcontext->__ss = g_regs.gregs;
@@ -175,9 +222,7 @@ static int do_restore(const char* path) {
 
     printf("mapping stack/code chunks at their original addresses... size=%llu\n", hdr.stack_len);
     munmap((void*)(uintptr_t)hdr.stack_addr, hdr.stack_len);
-    void* got_stack = mmap((void*)(uintptr_t)hdr.stack_addr, hdr.stack_len, PROT_READ | PROT_WRITE,
-                            MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
-    if (got_stack == MAP_FAILED) { perror("mmap stack"); return 1; }
+    void* got_stack = map_fixed_or_retry(hdr.stack_addr, hdr.stack_len, "stack");
     if ((uint64_t)(uintptr_t)got_stack != hdr.stack_addr) {
         fprintf(stderr, "MAP_FIXED did not honor the stack address\n"); return 1;
     } else {
@@ -191,24 +236,7 @@ static int do_restore(const char* path) {
            hdr.stack_checksum == restored_checksum ? "MATCH" : "MISMATCH");
 
     printf("allocating code chunk at its original address... size=%llu\n", hdr.code_len);
-    void* got_code = mmap((void*)(uintptr_t)hdr.code_addr, hdr.code_len, PROT_READ | PROT_WRITE,
-                           MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
-    if (got_code == MAP_FAILED) {
-        perror("mmap code");
-        /* mach_vm_deallocate already conclusively tested 2026-08-17 (13/13
-         * failed) -- not repeated here. Try everything else instead. */
-        const char* worked = try_reclaim_stuck_range(hdr.code_addr, hdr.code_len);
-        if (worked) {
-            printf("  RECLAIMED via: %s\n", worked);
-            got_code = (void*)(uintptr_t)hdr.code_addr;
-        } else {
-            printf("  PAUSED for inspection: pid=%d target=[0x%llx,0x%llx]\n"
-                   "  run: vmmap -noCoalesce -interleaved %d\n",
-                   getpid(), hdr.code_addr, hdr.code_addr + hdr.code_len, getpid());
-            pause(); /* attach vmmap, then kill this process when done */
-            return 1;
-        }
-    }
+    void* got_code = map_fixed_or_retry(hdr.code_addr, hdr.code_len, "code");
     if ((uint64_t)(uintptr_t)got_code != hdr.code_addr) {
         fprintf(stderr, "MAP_FIXED did not honor the code address\n"); return 1;
     } else {

@@ -56,6 +56,7 @@ typedef struct {
 typedef struct {
     uint32_t region_count;
     uint32_t _pad;
+    uint64_t capture_used;      /* bytes actually copied into g_capture_buf */
     regs_t   regs;
 } checkpoint_header_t;
 
@@ -214,7 +215,7 @@ static int do_checkpoint(const char* path, void* heap_val_addr) {
 
     FILE* f = fopen(path, "wb");
     if (!f) { perror("fopen"); return 1; }
-    checkpoint_header_t hdr = { .region_count = g_region_count, .regs = g_regs };
+    checkpoint_header_t hdr = { .region_count = g_region_count, .regs = g_regs, .capture_used = g_capture_used };
     fwrite(&hdr, sizeof(hdr), 1, f);
     fwrite(g_regions, sizeof(region_desc_t), g_region_count, f);
     fwrite(g_capture_buf, 1, g_capture_used, f);

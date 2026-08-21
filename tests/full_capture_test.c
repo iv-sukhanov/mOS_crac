@@ -279,14 +279,19 @@ static int do_checkpoint(const char* path, void* heap_val_addr) {
     printf("  heap_val self-check: live=%d captured=%d (%s)\n",
            live_val, captured_val, live_val == captured_val ? "MATCH" : "MISMATCH");
 
-    FILE* f = fopen(path, "wb");
-    if (!f) { perror("fopen"); return 1; }
-    checkpoint_header_t hdr = { .region_count = g_region_count, .regs = g_regs, .capture_used = g_capture_used };
-    fwrite(&hdr, sizeof(hdr), 1, f);
-    fwrite(g_regions, sizeof(region_desc_t), g_region_count, f);
-    fwrite(g_capture_buf, 1, g_capture_used, f);
-    fclose(f);
-    printf("checkpoint written to %s\n", path);
+    if (live_val == captured_val) {
+        FILE* f = fopen(path, "wb");
+        if (!f) { perror("fopen"); return 1; }
+        checkpoint_header_t hdr = { .region_count = g_region_count, .regs = g_regs, .capture_used = g_capture_used };
+        fwrite(&hdr, sizeof(hdr), 1, f);
+        fwrite(g_regions, sizeof(region_desc_t), g_region_count, f);
+        fwrite(g_capture_buf, 1, g_capture_used, f);
+        fclose(f);
+        printf("checkpoint written to %s\n", path);
+    } else {
+        printf("heap_val self-check failed, not writing checkpoint\n");
+    }
+
 
     return 0;
 }

@@ -32,8 +32,11 @@
 #include <string.h>
 #include <mach/thread_state.h>
 #include <mach/mach_vm.h>
+#include <mach/task.h>
+#include <mach-o/dyld_images.h>
 #include <libproc.h>
 #include <sys/param.h>
+#include <sys/mman.h>
 
 #define MAX_REGIONS       256
 #define CAPTURE_BUF_BYTES (512u * 1024 * 1024)  /* static/BSS, not malloc'd --
@@ -63,23 +66,70 @@ typedef struct {
 static region_desc_t g_regions[MAX_REGIONS];
 static uint32_t g_region_count;
 static regs_t g_regs;
-/* Static/BSS, not malloc()'d, deliberately: this buffer is itself a private
- * RW region of the very process being captured. A static array's address is
- * fixed at link time, before classify_regions() ever runs, so it's already
- * one of the regions the walk sees from the start -- should_capture() below
- * explicitly excludes it (own-driver bookkeeping, not the target's state).
- * Allocating it at runtime instead (malloc(), sized off classify_regions()'s
- * own total) was tried first and reverted: the malloc call itself is a new
- * private allocation made *after* classification, so it can't be excluded
- * by address (unknown yet) and isn't reflected in the region list captured
- * moments later either way -- static/BSS sidesteps the ordering problem
- * entirely instead of solving it. */
-static uint8_t g_capture_buf[CAPTURE_BUF_BYTES];
+/* An explicit mmap(), not a static/BSS array -- found necessary the hard
+ * way 2026-08-21 (NOTES.md): a plain `static uint8_t g_capture_buf[...]`
+ * gets packed by the linker right next to whatever small globals precede
+ * it in BSS (confirmed directly: a reproduction had a 4-byte-int global and
+ * the capture buffer share the exact same 16KB kernel-reported region).
+ * should_capture()'s self-exclusion then throws out that *whole* region --
+ * g_region_count/g_regs/etc. included, since they're in the same region as
+ * part of the buffer -- which is exactly why a restored process was reading
+ * those back as zero after resuming. A separate mmap() is a genuinely
+ * distinct vm_map entry (confirmed: lands tens of MB away from everything
+ * else), so excluding it can't collide with anything real ever again.
+ * Called once, at the very start of main(), before anything else runs --
+ * still well before classify_regions(), so the earlier ordering concern
+ * (an allocation appearing *after* classification, unable to be excluded by
+ * address or reflected in the captured list) doesn't apply here. */
+static uint8_t* g_capture_buf;
 static const uint64_t g_capture_buf_cap = CAPTURE_BUF_BYTES;
 static uint64_t g_capture_used;
 
 static int g_heap_val_index = -1;   /* which g_regions[] entry holds it, for the self-check */
 static uint64_t g_heap_val_off;     /* byte offset of heap_val within that region */
+
+/* Is this address structurally inside a nested submap? A depth=0 (non-
+ * recursing) mach_vm_region_recurse resolves a plain private address (heap,
+ * stack, our own __DATA) directly, is_submap=0. The dyld shared cache is
+ * mapped via nested submaps (established 2026-08-11/12) -- any address
+ * inside it, even a leaf page that's since been privatized via copy-on-
+ * write, resolves at depth=0 to the *submap's own* boundary, is_submap=1.
+ * Confirmed directly 2026-08-21: our own data/code/stack all is_submap=0;
+ * a known CoW'd-from-cache page resolved to a 640MB is_submap=1 entry. */
+static bool in_shared_cache_submap(mach_vm_address_t addr) {
+    mach_vm_address_t a = addr;
+    mach_vm_size_t size = 0;
+    natural_t depth = 0;
+    vm_region_submap_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+    kern_return_t kr = mach_vm_region_recurse(mach_task_self(), &a, &size, &depth,
+                                               (vm_region_recurse_info_t)&info, &count);
+    return kr == KERN_SUCCESS && info.is_submap;
+}
+
+/* Complementary check for a CoW'd cache page that's fully detached from the
+ * submap (is_submap=0 too -- found empirically 2026-08-21: not every
+ * privatized cache page stays nested, "unused system shared lib __DATA" per
+ * vmmap either way, but only *some* still resolve as a submap boundary).
+ * sharedCacheBaseAddress comes from task_info(TASK_DYLD_INFO)'s
+ * dyld_all_image_infos -- a real, already-ASLR-slid runtime address,
+ * confirmed directly to match where the cache's own regions actually start
+ * on this machine. CACHE_SPAN_BYTES is a generous (not exact) guess at the
+ * cache's extent -- the combined dyld_shared_cache_arm64e[.01/.02] files
+ * observed on this machine sum to ~5.6GB; 8GB covers that with headroom.
+ * A generous guess, not a precise bound, is deliberate: this only ever
+ * excludes candidates that already passed every other check, so a false
+ * positive here means capturing a few bytes of cache-adjacent memory
+ * unnecessarily, not missing something real. */
+#define CACHE_SPAN_BYTES (8ull * 1024 * 1024 * 1024)
+static bool in_shared_cache_range(mach_vm_address_t addr) {
+    task_dyld_info_data_t info;
+    mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&info, &count) != KERN_SUCCESS) return false;
+    struct dyld_all_image_infos* infos = (struct dyld_all_image_infos*)(uintptr_t)info.all_image_info_addr;
+    uint64_t base = (uint64_t)infos->sharedCacheBaseAddress;
+    return base != 0 && (uint64_t)addr >= base && (uint64_t)addr < base + CACHE_SPAN_BYTES;
+}
 
 /* Decide whether a region is worth capturing. Not signal-handler code --
  * called only during the pre-signal classification pass. */
@@ -108,6 +158,22 @@ static bool should_capture(mach_vm_address_t addr, mach_vm_size_t size,
         char buf[MAXPATHLEN];
         int ret = proc_regionfilename(getpid(), addr, buf, sizeof(buf));
         if (ret <= 0) return false;
+    } else if (in_shared_cache_submap(addr) || in_shared_cache_range(addr)) {
+        /* Caught what external_pager alone misses (2026-08-21, found from a
+         * real restore failure -- EACCES on mmap(MAP_FIXED), a different
+         * signature than the usual malloc-guard-page ENOMEM): a shared-
+         * cache page that's been privatized via copy-on-write reports
+         * external_pager=0 (genuinely private now, at the VM level), so the
+         * branch above never even runs for it. Two checks, not one: some
+         * such pages stay nested in the cache's own submap (caught by
+         * in_shared_cache_submap), others fully detach from it (caught only
+         * by the address-range check) -- both observed directly on this
+         * machine for what vmmap itself labels the same way either case.
+         * It's dyld/libSystem's own internal artifact of how the loader
+         * happened to privatize one page, not anything the checkpointed
+         * program logically depends on; the restoring process's own fresh
+         * dyld privatizes its own copy the same way if it ever needs to. */
+        return false;
     }
     return true;
 }
@@ -234,6 +300,11 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    /* First thing, deliberately -- see the note on g_capture_buf's
+     * declaration for why this can't be a static array. */
+    g_capture_buf = mmap(NULL, CAPTURE_BUF_BYTES, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (g_capture_buf == MAP_FAILED) { perror("mmap capture buffer"); return 1; }
+
     int* heap_val = malloc(sizeof(int));
     if (!heap_val) { perror("malloc"); return 1; }
     *heap_val = 42;
@@ -241,11 +312,15 @@ int main(int argc, char** argv) {
     if (do_checkpoint(argv[1], heap_val) != 0) return 1;
 
     printf("post-checkpoint: heap_val=%d, running...\n", *heap_val);
+    uint8_t times = 0;
     for (;;) {
         g_global_counter++;
         if (g_global_counter % 200000000ULL == 0) {
             printf("  alive: global_counter=%llu heap_val=%d\n", g_global_counter, *heap_val);
+            times++;
         }
+
+        if (times > 4) exit(0); /* exit normally after a few iterations, so the test harness doesn't think it hung */
     }
     return 0; /* unreachable */
 }

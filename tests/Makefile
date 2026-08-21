@@ -2,6 +2,7 @@ CC        ?= clang
 CFLAGS    ?= -g -Wall -Wextra
 BINDIR    ?= /tmp
 CKPT_FILE ?= /tmp/ckpt.bin
+RETRY_NUMBER ?= 1
 
 # Generic rule: build any tests/<name>.c as $(BINDIR)/<name>. Works for every
 # throwaway test in this directory, not just sim_checkpoint_test.
@@ -72,6 +73,11 @@ freestanding-hello: freestanding_hello.s strip_lc_load_dylib.py
 # to stop it once you've seen the self-check pass.
 full-capture: $(BINDIR)/full_capture_test
 	$(BINDIR)/full_capture_test $(CKPT_FILE)
+
+full-noaslr-restore: $(BINDIR)/full_restore_test $(BINDIR)/spawn_noaslr
+	$(BINDIR)/spawn_noaslr -r $(RETRY_NUMBER) $(BINDIR)/full_restore_test $(CKPT_FILE)
+
+full-run: full-capture full-noaslr-restore
 
 clean:
 	rm -f $(CKPT_FILE)

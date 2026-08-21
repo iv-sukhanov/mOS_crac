@@ -23,12 +23,11 @@ typedef struct {
     uint32_t _pad;
 } region_desc_t;
 
-/* Must match full_capture_test.c's checkpoint_header_t byte-for-byte -- no
- * capture_used field there; that total is derivable by summing the region
- * descriptors' lengths (see do_restore()), so it isn't stored separately. */
+/* Must match full_capture_test.c's checkpoint_header_t byte-for-byte. */
 typedef struct {
     uint32_t region_count;
     uint32_t _pad;
+    uint64_t capture_used;      /* bytes actually copied into g_capture_buf */
     regs_t   regs;
 } checkpoint_header_t;
 
@@ -109,22 +108,28 @@ static int do_restore(const char* path) {
         fclose(f);
         return 1;
     }
+    if (hdr.capture_used > g_capture_buf_cap) {
+        fprintf(stderr, "capture_used %llu exceeds buffer capacity %llu\n", hdr.capture_used, g_capture_buf_cap);
+        fclose(f);
+        return 1;
+    }
     if (fread(g_regions, sizeof(region_desc_t), hdr.region_count, f) != hdr.region_count) {
         fprintf(stderr, "short read on region descriptors\n");
         fclose(f);
         return 1;
     }
-
-    /* capture_used isn't stored in the file -- derive it the same way
-     * full_capture_test.c's own descriptor list already implies it. */
-    uint64_t capture_used = 0;
-    for (uint32_t i = 0; i < hdr.region_count; i++) capture_used += g_regions[i].len;
-    if (capture_used > g_capture_buf_cap) {
-        fprintf(stderr, "capture needs %llu bytes, buffer is only %llu\n", capture_used, g_capture_buf_cap);
+    /* Cross-check hdr.capture_used against what the region list itself
+     * implies -- catches a corrupt/mismatched file instead of trusting a
+     * single stored number blindly. */
+    uint64_t region_total = 0;
+    for (uint32_t i = 0; i < hdr.region_count; i++) region_total += g_regions[i].len;
+    if (region_total != hdr.capture_used) {
+        fprintf(stderr, "capture_used (%llu) doesn't match sum of region lengths (%llu) -- corrupt file?\n",
+                hdr.capture_used, region_total);
         fclose(f);
         return 1;
     }
-    if (fread(g_capture_buf, 1, capture_used, f) != capture_used) {
+    if (fread(g_capture_buf, 1, hdr.capture_used, f) != hdr.capture_used) {
         fprintf(stderr, "short read on capture buffer\n");
         fclose(f);
         return 1;
@@ -132,7 +137,7 @@ static int do_restore(const char* path) {
     fclose(f);
 
     printf("read %u regions, %.2f MB, pc=0x%llx sp=0x%llx\n",
-           hdr.region_count, capture_used / 1048576.0,
+           hdr.region_count, hdr.capture_used / 1048576.0,
            hdr.regs.gregs.__pc, hdr.regs.gregs.__sp);
 
     if (remap_regions(hdr.region_count) != 0) {

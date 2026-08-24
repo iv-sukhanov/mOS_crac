@@ -9,7 +9,7 @@ RETRY_NUMBER ?= 1
 $(BINDIR)/%: %.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello resume-noaslr-retry run-noaslr-retry full-capture
+.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign
 
 checkpoint: $(BINDIR)/sim_checkpoint_test
 	$(BINDIR)/sim_checkpoint_test checkpoint $(CKPT_FILE)
@@ -78,6 +78,15 @@ full-noaslr-restore: $(BINDIR)/full_restore_test $(BINDIR)/spawn_noaslr
 	$(BINDIR)/spawn_noaslr -r $(RETRY_NUMBER) $(BINDIR)/full_restore_test $(CKPT_FILE)
 
 full-run: full-capture full-noaslr-restore
+
+# bsdthread_create_test.c's current round (docs/007, 2026-08-24/25) calls
+# ptrauth_sign_unauthenticated/ptrauth_auth_data directly -- those intrinsics
+# only exist when compiling for arm64e specifically (__has_feature(ptrauth_calls)),
+# unlike every earlier round of this file, which only fed raw bytes to
+# __bsdthread_create and needed no special arch flag.
+bsdthread-munge-selfsign: bsdthread_create_test.c
+	$(CC) $(CFLAGS) -arch arm64e -o $(BINDIR)/bsdthread_create_test bsdthread_create_test.c
+	$(BINDIR)/bsdthread_create_test
 
 clean:
 	rm -f $(CKPT_FILE)

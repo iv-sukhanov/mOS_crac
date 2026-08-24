@@ -1,16 +1,24 @@
-/* Follow-up (2026-08-24, third round): does PAC's signature depend on the
- * struct pthread's own storage *address*, not just process identity (i.e.
- * the PAC key)? Earlier today: a real struct borrowed *in place* (same
- * process, same address) passed PAC; a real struct copied to a genuinely
- * different *process* traps. This isolates the address variable alone --
- * same process (same PAC key), same bytes, but physically relocated to a
- * different address before calling __bsdthread_create. If PAC's
- * discriminator/salt incorporates the pointer's own storage location (a
- * standard PAC defense against copying a valid signature somewhere else),
- * this should trap identically to the cross-process case. If it doesn't,
- * it should pass.
+/* Fourth round, 2026-08-24/25: does self-computing a PAC signature (rather
+ * than replaying one) let a relocated struct pthread pass BOTH of
+ * _pthread_validate_signature's checks -- the hardware autdb and the
+ * software `decoded_addr == current_addr` comparison -- for a NEW address?
+ *
+ * Mechanism (see docs/007): sig = sign_unauth(addr, key B, "pthread.signature")
+ * ^ munge_token. Earlier round (still in git history) moved a real struct to
+ * a new address WITHOUT touching its sig field -- PAC itself passed (same
+ * process, same key), but the software check failed ("PThread Corruption"),
+ * because the old sig still decoded to the OLD address.
+ *
+ * This time: recover munge_token from a real, live, validly-signed thread
+ * (munge = live->sig ^ sign_unauth(live_addr, ...) -- pure algebra, no
+ * privileged access needed), then compute a FRESH sig for the struct's NEW
+ * address and overwrite the copied struct's sig field with it before
+ * calling __bsdthread_create. If this passes, struct-pthread identity can
+ * be re-established at an address of OUR choosing, in-process, without
+ * borrowing signed bytes from anywhere -- untested until now.
  */
 #include <pthread.h>
+#include <ptrauth.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +26,11 @@
 #include <stdint.h>
 #include <errno.h>
 #include <sys/mman.h>
+#include <mach/mach.h>
+
+#if !__has_feature(ptrauth_calls)
+#error "build with -arch arm64e -- ptrauth intrinsics aren't available otherwise"
+#endif
 
 #define PTHREAD_START_CUSTOM 0x01000000u
 #define CAPTURE_LEN (16 * 1024)
@@ -26,15 +39,22 @@
 extern void *__bsdthread_create(void *func, void *func_arg, void *stack,
                                  void *pthread, uint32_t flags);
 
+/* Same (addr, key, discriminator) triple as libpthread's own
+ * _pthread_init_signature/_pthread_validate_signature (docs/007). */
+static uintptr_t sign_for_addr(uintptr_t addr) {
+    return (uintptr_t)ptrauth_sign_unauthenticated(
+        (void *)addr, ptrauth_key_process_dependent_data,
+        ptrauth_string_discriminator("pthread.signature"));
+}
+
 static volatile uint64_t g_real_addr;
 static volatile int g_real_ready = 0;
 
 static void* real_thread_fn(void* arg) {
     (void)arg;
     pthread_t self = pthread_self();
-    uint64_t tpidrro;
-    __asm__ volatile ("mrs %0, tpidrro_el0" : "=r" (tpidrro));
-    printf("real_thread_fn: pthread_self()=%p tpidrro_el0=0x%llx\n", (void*)self, tpidrro);
+    mach_port_t mp = pthread_mach_thread_np(self);
+    printf("real_thread_fn: pthread_self()=%p, mach_port=0x%x\n", (void*)self, (void*)mp);
     g_real_addr = (uint64_t)(uintptr_t)self;
     g_real_ready = 1;
     for (;;) pause();
@@ -43,8 +63,8 @@ static void* real_thread_fn(void* arg) {
 
 static volatile int g_result = -1;
 
-/* Same hand-rolled-write idiom as the earlier tests: if TPIDRRO_EL0 isn't
- * valid yet, don't let checking that be the thing that crashes first. */
+/* Hand-rolled write, not printf: if identity still isn't fully valid,
+ * don't let checking that be the thing that crashes first. */
 static void moved_thread_fn(void *arg) {
     (void)arg;
     uint64_t tpidrro;
@@ -74,32 +94,41 @@ int main(void) {
     if (!g_real_ready) { fprintf(stderr, "thread never checked in\n"); return 1; }
 
     uint64_t struct_addr = g_real_addr;
+
+    /* Step 1: recover munge_token algebraically from the live, genuinely
+     * pthread_create()'d thread -- no need to find where the OS actually
+     * seeds it (docs/007's apple[] check came back empty on this build). */
+    uintptr_t stored_sig = *(uintptr_t *)(uintptr_t)struct_addr;
+    uintptr_t munge = stored_sig ^ sign_for_addr(struct_addr);
+    printf("recovered munge_token=0x%lx (from live struct at 0x%llx, sig=0x%lx)\n",
+           munge, (unsigned long long)struct_addr, stored_sig);
+
+    /* Step 2: copy the real struct's page(s) to a genuinely different
+     * address, same as the previous round -- gives us a plausible rest-of-
+     * struct (tsd, thread_id, etc.), not just a correct sig field. */
     uint64_t region_start = struct_addr & ~((uint64_t)page_size - 1);
     uint64_t region_end = struct_addr + CAPTURE_LEN;
     uint64_t region_len = ((region_end - region_start) + (uint64_t)page_size - 1) & ~((uint64_t)page_size - 1);
     uint64_t offset_in_region = struct_addr - region_start;
 
-    printf("original struct_addr=0x%llx region=[0x%llx,0x%llx)\n",
-           (unsigned long long)struct_addr, (unsigned long long)region_start,
-           (unsigned long long)(region_start + region_len));
-
-    /* Ordinary (non-fixed) mmap -- the OS picks a genuinely different
-     * address, guaranteed not to collide with the original. Same process,
-     * same PAC key throughout; only the struct's storage address changes. */
     void* new_region = mmap(NULL, region_len, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     if (new_region == MAP_FAILED) { perror("mmap new region"); return 1; }
     memcpy(new_region, (void*)(uintptr_t)region_start, region_len);
     uint64_t new_struct_addr = (uint64_t)(uintptr_t)new_region + offset_in_region;
 
-    printf("moved struct to new_struct_addr=0x%llx (new region [0x%llx,0x%llx))\n",
-           (unsigned long long)new_struct_addr, (unsigned long long)(uintptr_t)new_region,
-           (unsigned long long)((uintptr_t)new_region + region_len));
+    /* Step 3: the actual new lever -- self-compute a valid sig for the
+     * struct's NEW address and overwrite the copied (stale-for-here) one. */
+    uintptr_t new_sig = sign_for_addr(new_struct_addr) ^ munge;
+    *(uintptr_t *)(uintptr_t)new_struct_addr = new_sig;
+
+    printf("moved struct to new_struct_addr=0x%llx, self-signed sig=0x%lx\n",
+           (unsigned long long)new_struct_addr, new_sig);
 
     void* stack = malloc(STACK_SIZE);
     if (!stack) { perror("malloc stack"); return 1; }
     void* stack_top = (char*)stack + STACK_SIZE;
 
-    printf("calling __bsdthread_create with the MOVED struct (same process, different address)...\n");
+    printf("calling __bsdthread_create with the self-signed struct...\n");
     fflush(stdout);
 
     errno = 0;
@@ -115,7 +144,7 @@ int main(void) {
 
     for (int i = 0; i < 100 && g_result == -1; i++) usleep(50000);
     printf("result: %s\n",
-           g_result == 1 ? "ran without crashing (compare the tpidrro_el0 above against original/new addresses)" :
-                            "TIMED OUT -- crashed or never ran (check exit signal)");
+           g_result == 1 ? "PASSED -- self-signed struct survived _pthread_start at its new address" :
+                            "TIMED OUT -- crashed or never ran (check exit signal / crash report)");
     return 0;
 }

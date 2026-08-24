@@ -9,7 +9,7 @@ RETRY_NUMBER ?= 1
 $(BINDIR)/%: %.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign
+.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign thread-capture thread-restore thread-run
 
 checkpoint: $(BINDIR)/sim_checkpoint_test
 	$(BINDIR)/sim_checkpoint_test checkpoint $(CKPT_FILE)
@@ -87,6 +87,21 @@ full-run: full-capture full-noaslr-restore
 bsdthread-munge-selfsign: bsdthread_create_test.c
 	$(CC) $(CFLAGS) -arch arm64e -o $(BINDIR)/bsdthread_create_test bsdthread_create_test.c
 	$(BINDIR)/bsdthread_create_test
+
+# Single-worker-thread capture + mode-D restore (docs/007, 2026-08-25):
+# recreate the captured thread via a self-signed __bsdthread_create()
+# instead of hijacking main() (2026-08-21's known stuck-process bug).
+# Capture stays plain arm64 (no arch flag, matching every other
+# capture/restore file); restore needs -arch arm64e for real (non-NOP'd)
+# PAC -- see thread_restore_test.c's file header for why.
+thread-capture: $(BINDIR)/thread_capture_test
+	$(BINDIR)/thread_capture_test $(CKPT_FILE)
+
+thread-restore: thread_restore_test.c $(BINDIR)/spawn_noaslr
+	$(CC) $(CFLAGS) -arch arm64e -o $(BINDIR)/thread_restore_test thread_restore_test.c
+	$(BINDIR)/spawn_noaslr -r $(RETRY_NUMBER) $(BINDIR)/thread_restore_test $(CKPT_FILE)
+
+thread-run: thread-capture thread-restore
 
 clean:
 	rm -f $(CKPT_FILE)

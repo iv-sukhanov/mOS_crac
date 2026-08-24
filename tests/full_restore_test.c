@@ -33,7 +33,21 @@ typedef struct {
 
 static regs_t g_regs;
 static region_desc_t g_regions[MAX_REGIONS];
-static uint8_t g_capture_buf[CAPTURE_BUF_BYTES];
+/* An explicit mmap(), not a static/BSS array (2026-08-25 -- found the hard
+ * way while building thread_restore_test.c, which copied this file's shape
+ * verbatim): a static array here can land at *any* address the linker
+ * happens to choose, with nothing excluding it from remap_regions()'s own
+ * MAP_FIXED targets the way should_capture() excludes the capture side's
+ * own scratch buffer (full_capture_test.c, 2026-08-21). Unlike the guard-
+ * page/shared-cache collisions, MAP_FIXED overwriting this buffer doesn't
+ * fail with ENOMEM -- it's an ordinary mapping, so MAP_FIXED just silently
+ * replaces it, corrupting g_capture_buf's own bytes mid-copy if a captured
+ * region's original address happens to overlap wherever this buffer landed.
+ * An explicit mmap() is a genuinely separate vm_map entry (confirmed
+ * 2026-08-21 to land tens of MB away from everything else), making that
+ * collision far less likely -- not impossible, same as any other address,
+ * but no longer trivially likely to be right next to our own image. */
+static uint8_t* g_capture_buf;
 static const uint64_t g_capture_buf_cap = CAPTURE_BUF_BYTES;
 
 static int remap_regions(uint32_t region_count) {
@@ -164,6 +178,9 @@ int main(int argc, char** argv) {
         fprintf(stderr, "usage: %s <file>\n", argv[0]);
         return 2;
     }
+
+    g_capture_buf = mmap(NULL, CAPTURE_BUF_BYTES, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (g_capture_buf == MAP_FAILED) { perror("mmap capture buffer"); return 1; }
 
     return do_restore(argv[1]);
 

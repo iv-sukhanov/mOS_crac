@@ -32,7 +32,7 @@
 #error "build with -arch arm64e -- ptrauth intrinsics aren't available otherwise"
 #endif
 
-#define PTHREAD_START_CUSTOM 0x01000000u
+#define PTHREAD_START_CUSTOM 0x21000000u
 #define CAPTURE_LEN (16 * 1024)
 #define STACK_SIZE  (256 * 1024)
 
@@ -52,9 +52,14 @@ static volatile int g_real_ready = 0;
 
 static void* real_thread_fn(void* arg) {
     (void)arg;
+    
     pthread_t self = pthread_self();
     mach_port_t mp = pthread_mach_thread_np(self);
-    printf("real_thread_fn: pthread_self()=%p, mach_port=0x%x\n", (void*)self, (void*)mp);
+    
+    uint64_t tpidrro;
+    __asm__ volatile ("mrs %0, tpidrro_el0" : "=r" (tpidrro));
+    
+    printf("real_thread_fn: pthread_self()=%p, mach_port=0x%x, tpidrro_el0=0x%llx\n", (void*)self, (void*)mp, tpidrro);
     g_real_addr = (uint64_t)(uintptr_t)self;
     g_real_ready = 1;
     for (;;) pause();
@@ -141,6 +146,23 @@ int main(void) {
     }
     printf("__bsdthread_create returned %p -- waiting to see what happens...\n", ret);
     fflush(stdout);
+
+    mach_port_t main = mach_thread_self(), th1 = pthread_mach_thread_np(t), new_th = MACH_PORT_NULL;
+    thread_act_array_t act_list;
+    mach_msg_type_number_t act_number;
+    task_threads(mach_task_self(), &act_list, &act_number);
+
+    for (uint32_t i = 0; i < act_number; i++) {
+        if (act_list[i] != main && act_list[i] != th1) {
+            new_th = act_list[i];
+            break;
+        }
+    }
+
+    vm_deallocate(mach_task_self(), (vm_address_t)act_list, act_number * sizeof(thread_act_t));
+    sleep(3);
+    printf("resuming the new thread (mach_port=0x%x) -- if it crashes, check exit signal / crash report\n", (void*)new_th);
+    thread_resume(new_th);
 
     for (int i = 0; i < 100 && g_result == -1; i++) usleep(50000);
     printf("result: %s\n",

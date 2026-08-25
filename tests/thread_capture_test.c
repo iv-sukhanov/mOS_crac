@@ -56,21 +56,16 @@ typedef struct regs {
 typedef struct {
     uint64_t addr, len;
     uint32_t protection;
-    uint32_t _pad;
 } region_desc_t;
 
-/* Must match thread_restore_test.c's checkpoint_header_t byte-for-byte. */
+#define WORKER_TLS_VALUE 99
+
+// Must match thread_restore_test.c's checkpoint_header_t byte-for-byte.
 typedef struct {
     uint32_t region_count;
-    uint32_t _pad;
     uint64_t capture_used;
     regs_t   regs;
     uint64_t worker_struct_addr; /* worker's pthread_self(), for mode-D self-sign+recreate */
-    uint64_t raw_pc;             /* plain copy of regs.gregs.__pc -- see thread_restore_test.c
-                                     for why the restore side reads this instead of the opaque
-                                     gregs field directly */
-    int      tls_check_val;      /* worker's __thread value at the moment of capture */
-    uint32_t _pad2;
 } checkpoint_header_t;
 
 static region_desc_t g_regions[MAX_REGIONS];
@@ -81,7 +76,6 @@ static const uint64_t g_capture_buf_cap = CAPTURE_BUF_BYTES;
 static uint64_t g_capture_used;
 
 static uint64_t g_worker_struct_addr;
-static int g_worker_tls_val;
 static atomic_bool g_worker_ready = false;
 static atomic_bool g_captured = false;
 
@@ -182,7 +176,7 @@ static __thread int g_tls_val;
 
 static void* worker_fn(void* arg) {
     (void)arg;
-    g_tls_val = 99;
+    g_tls_val = WORKER_TLS_VALUE;
     g_worker_struct_addr = (uint64_t)(uintptr_t)pthread_self();
     atomic_store(&g_worker_ready, true);
 
@@ -191,7 +185,7 @@ static void* worker_fn(void* arg) {
         counter++;
         if (counter % 200000000ULL == 0) {
             printf("  worker alive: counter=%llu tls_val=%d\n",
-                   (unsigned long long)counter, g_tls_val);
+                   (uint64_t)counter, g_tls_val);
         }
     }
     return NULL; /* unreachable */
@@ -222,12 +216,12 @@ int main(int argc, char** argv) {
     for (uint32_t i = 0; i < g_region_count; i++) {
         total += g_regions[i].len;
         printf("  region[%u] [0x%llx,0x%llx) %.2fMB prot=%u\n", i,
-               (unsigned long long)g_regions[i].addr,
-               (unsigned long long)(g_regions[i].addr + g_regions[i].len),
+               (uint64_t)g_regions[i].addr,
+               (uint64_t)(g_regions[i].addr + g_regions[i].len),
                g_regions[i].len / 1048576.0, g_regions[i].protection);
     }
     printf("classified %u regions, %.2f MB total; worker struct_addr=0x%llx\n",
-           g_region_count, total / 1048576.0, (unsigned long long)g_worker_struct_addr);
+           g_region_count, total / 1048576.0, (uint64_t)g_worker_struct_addr);
     if (total > g_capture_buf_cap) {
         fprintf(stderr, "capture needs %.2fMB, buffer is only %.2fMB\n",
                 total / 1048576.0, g_capture_buf_cap / 1048576.0);
@@ -239,8 +233,8 @@ int main(int argc, char** argv) {
 
     printf("captured %u regions, %.2f MB, pc=0x%llx sp=0x%llx tpidr=0x%llx\n",
            g_region_count, g_capture_used / 1048576.0,
-           (unsigned long long)g_regs.gregs.__pc, (unsigned long long)g_regs.gregs.__sp,
-           (unsigned long long)g_regs.tpidr);
+           (uint64_t)g_regs.gregs.__pc, (uint64_t)g_regs.gregs.__sp,
+           (uint64_t)g_regs.tpidr);
 
     FILE* f = fopen(argv[1], "wb");
     if (!f) { perror("fopen"); return 1; }
@@ -249,23 +243,13 @@ int main(int argc, char** argv) {
         .capture_used = g_capture_used,
         .regs = g_regs,
         .worker_struct_addr = g_worker_struct_addr,
-        .raw_pc = g_regs.gregs.__pc,
-        .tls_check_val = g_tls_val, /* main thread's own copy is 0 -- __thread is per-thread by
-                                        definition; the interesting value is g_worker_tls_val,
-                                        read from the worker's own storage, below */
     };
-    (void)g_worker_tls_val;
-    /* Read the worker's __thread value from outside the worker: not directly possible for a
-     * true __thread variable (no cross-thread accessor) -- it's already known to be 99, set at
-     * worker_fn's very first line, unconditionally, before anything else. Record that constant
-     * directly instead of fabricating a fake read. */
-    hdr.tls_check_val = 99;
     fwrite(&hdr, sizeof(hdr), 1, f);
     fwrite(g_regions, sizeof(region_desc_t), g_region_count, f);
     fwrite(g_capture_buf, 1, g_capture_used, f);
     fclose(f);
     printf("checkpoint written to %s (worker_struct_addr=0x%llx, expected tls_val=%d)\n",
-           argv[1], (unsigned long long)g_worker_struct_addr, hdr.tls_check_val);
+           argv[1], (uint64_t)g_worker_struct_addr, WORKER_TLS_VALUE);
 
     /* Let the worker keep running a little, same as full_capture_test.c, so the checkpoint
      * being written doesn't race with the process exiting before fwrite() lands. */

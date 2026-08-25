@@ -66,19 +66,17 @@ typedef struct regs {
 typedef struct {
     uint64_t addr, len;
     uint32_t protection;
-    uint32_t _pad;
 } region_desc_t;
 
-/* Must match thread_capture_test.c's checkpoint_header_t byte-for-byte. */
+/* Must match thread_capture_test.c's copy. */
+#define WORKER_TLS_VALUE 99
+
+// Must match thread_capture_test.c's checkpoint_header_t byte-for-byte
 typedef struct {
     uint32_t region_count;
-    uint32_t _pad;
     uint64_t capture_used;
     regs_t   regs;
     uint64_t worker_struct_addr;
-    uint64_t raw_pc;
-    int      tls_check_val;
-    uint32_t _pad2;
 } checkpoint_header_t;
 
 static regs_t g_regs;
@@ -182,16 +180,6 @@ __asm__(
     "  br   x16\n"
 );
 
-static volatile uint64_t g_helper_addr;
-static atomic_bool g_helper_ready = false;
-static void* helper_fn(void* arg) {
-    (void)arg;
-    g_helper_addr = (uint64_t)(uintptr_t)pthread_self();
-    atomic_store(&g_helper_ready, true);
-    for (;;) pause();
-    return NULL;
-}
-
 static void* dummy_entry_fn(void* arg) { (void)arg; for (;;) pause(); return NULL; }
 
 static int do_restore(const char* path) {
@@ -215,23 +203,23 @@ static int do_restore(const char* path) {
     fclose(f);
     g_regs = hdr.regs;
 
-    printf("read %u regions, %.2f MB, worker_struct_addr=0x%llx pc=0x%llx expected tls_val=%d\n",
+    printf("read %u regions, %.2f MB, worker_struct_addr=0x%llx expected tls_val=%d\n",
            hdr.region_count, hdr.capture_used / 1048576.0,
-           (unsigned long long)hdr.worker_struct_addr, (unsigned long long)hdr.raw_pc, hdr.tls_check_val);
+           (unsigned long long)hdr.worker_struct_addr, WORKER_TLS_VALUE);
 
     if (remap_regions(hdr.region_count) != 0) { fprintf(stderr, "failed to remap regions\n"); return 1; }
     printf("all regions remapped at their original addresses\n");
 
     /* Recover munge_token from a real, live, validly-signed thread in THIS
      * process (docs/007's algebraic trick), then self-sign a fresh `sig`
-     * for the worker's ORIGINAL (now-restored) address. */
-    pthread_t helper;
-    if (pthread_create(&helper, NULL, helper_fn, NULL) != 0) { perror("pthread_create(helper)"); return 1; }
-    while (!atomic_load(&g_helper_ready)) usleep(1000);
-
-    uintptr_t helper_addr = (uintptr_t)g_helper_addr;
-    uintptr_t stored_sig = *(uintptr_t *)helper_addr;
-    uintptr_t munge = stored_sig ^ sign_for_addr(helper_addr);
+     * for the worker's ORIGINAL (now-restored) address. main() is a real
+     * pthread too (_pthread_main_thread_init() runs the same
+     * _pthread_init_signature() any pthread_create()'d thread gets) -- no
+     * need to spawn a dedicated thread just to have a signed struct to
+     * borrow from. */
+    uintptr_t self_addr = (uintptr_t)pthread_self();
+    uintptr_t stored_sig = *(uintptr_t *)self_addr;
+    uintptr_t munge = stored_sig ^ sign_for_addr(self_addr);
 
     uintptr_t worker_addr = (uintptr_t)hdr.worker_struct_addr;
     uintptr_t new_sig = sign_for_addr(worker_addr) ^ munge;
@@ -255,10 +243,10 @@ static int do_restore(const char* path) {
     /* Find the new thread's real mach port via task_threads() -- bypasses
      * pthread_mach_thread_np()'s __pthread_head list-membership dependency
      * entirely, confirmed 2026-08-25 to be the wall a self-signed-but-
-     * unregistered struct hits there. Elimination against the two known
-     * ports (main + helper) leaves exactly the new one. */
+     * unregistered struct hits there. Only main is a known port now (no
+     * helper thread), so elimination against it alone leaves exactly the
+     * new one -- main + the new thread is the whole process at this point. */
     mach_port_t main_port = mach_thread_self();
-    mach_port_t helper_port = pthread_mach_thread_np(helper);
     thread_act_array_t acts;
     mach_msg_type_number_t n_acts;
     if (task_threads(mach_task_self(), &acts, &n_acts) != KERN_SUCCESS) {
@@ -266,7 +254,7 @@ static int do_restore(const char* path) {
     }
     mach_port_t worker_port = MACH_PORT_NULL;
     for (mach_msg_type_number_t i = 0; i < n_acts; i++) {
-        if (acts[i] != main_port && acts[i] != helper_port) { worker_port = acts[i]; break; }
+        if (acts[i] != main_port) { worker_port = acts[i]; break; }
     }
     vm_deallocate(mach_task_self(), (vm_address_t)acts, sizeof(thread_act_t) * n_acts);
     if (worker_port == MACH_PORT_NULL) {
@@ -309,7 +297,10 @@ static int do_restore(const char* path) {
      * doesn't matter (and per the note above, sending it a raw captured
      * value there was exactly what faulted). */
     tls_seed_data[0] = g_regs.tpidr;
-    tls_seed_data[1] = hdr.raw_pc;
+    tls_seed_data[1] = (uint64_t)(uintptr_t)g_regs.gregs.__opaque_pc; /* plain cast -- same
+        reasoning as __opaque_sp below: these are raw, never-signed bytes from a plain-arm64
+        capture process, safe to read as a bit pattern outside any ptrauth macro. No separate
+        header field needed, g_regs.gregs already carries this value. */
     tls_seed_data[2] = (uint64_t)(uintptr_t)g_regs.gregs.__opaque_sp; /* plain cast, not
         thread_set_state -- the trampoline loads this into sp itself via `mov`, see above */
     arm_thread_state64_set_pc_fptr(state, &tls_seed_trampoline);
@@ -320,7 +311,7 @@ static int do_restore(const char* path) {
     if (kr != KERN_SUCCESS) { fprintf(stderr, "thread_set_state(NEON) failed: %d\n", kr); }
 
     printf("resuming -- watch for the worker's own periodic prints below "
-           "(tls_val should read %d if TPIDR_EL0 seeded correctly)\n", hdr.tls_check_val);
+           "(tls_val should read %d if TPIDR_EL0 seeded correctly)\n", WORKER_TLS_VALUE);
     kr = thread_resume(worker_port);
     if (kr != KERN_SUCCESS) { fprintf(stderr, "thread_resume failed: %d\n", kr); return 1; }
 

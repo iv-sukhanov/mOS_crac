@@ -19,9 +19,11 @@
  */
 #include <pthread.h>
 #include <ptrauth.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <errno.h>
@@ -48,7 +50,7 @@ static uintptr_t sign_for_addr(uintptr_t addr) {
 }
 
 static volatile uint64_t g_real_addr;
-static volatile int g_real_ready = 0;
+static volatile atomic_int g_real_ready = 0;
 
 static void* real_thread_fn(void* arg) {
     (void)arg;
@@ -61,7 +63,14 @@ static void* real_thread_fn(void* arg) {
     
     printf("real_thread_fn: pthread_self()=%p, mach_port=0x%x, tpidrro_el0=0x%llx\n", (void*)self, (void*)mp, tpidrro);
     g_real_addr = (uint64_t)(uintptr_t)self;
-    g_real_ready = 1;
+    
+    int ready = atomic_load(&g_real_ready);
+    if (ready == 1) {
+        printf("real_thread_fn: g_real_ready=1, signaling\n");
+        raise(SIGUSR1); /* wake up the main thread so it doesn't just sit there */
+        for (;;) pause();
+    }
+    atomic_store(&g_real_ready, 1);
     for (;;) pause();
     return NULL; /* unreachable */
 }
@@ -89,14 +98,19 @@ static void moved_thread_fn(void *arg) {
     for (;;) pause();
 }
 
+void action(int sig, siginfo_t *info, void *ctx) {
+    char buf[] = "Inside signal handler\n";
+    write(STDOUT_FILENO, buf, sizeof(buf) - 1);
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     long page_size = sysconf(_SC_PAGESIZE);
 
     pthread_t t;
     if (pthread_create(&t, NULL, real_thread_fn, NULL) != 0) { perror("pthread_create"); return 1; }
-    for (int i = 0; i < 100 && !g_real_ready; i++) usleep(10000);
-    if (!g_real_ready) { fprintf(stderr, "thread never checked in\n"); return 1; }
+    for (int i = 0; i < 100 && !atomic_load(&g_real_ready); i++) usleep(10000);
+    if (!atomic_load(&g_real_ready)) { fprintf(stderr, "thread never checked in\n"); return 1; }
 
     uint64_t struct_addr = g_real_addr;
 
@@ -147,6 +161,18 @@ int main(void) {
     printf("__bsdthread_create returned %p -- waiting to see what happens...\n", ret);
     fflush(stdout);
 
+    // mach_port_t np = pthread_mach_thread_np((pthread_t)(uintptr_t)new_struct_addr);
+    // printf("new thread's mach port is 0x%x\n", (void*)np);
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_flags = SA_SIGINFO;
+    sa.__sigaction_u.__sa_sigaction = action;
+    if (sigaction(SIGUSR1, &sa, NULL) == -1) { perror("sigaction"); return 1; }
+
+    int rv = pthread_kill((pthread_t)(intptr_t)new_struct_addr, SIGUSR1); /* wake up the real thread so it doesn't just sit there */
+    printf("pthread_kill returned %d\n", rv);
+
     mach_port_t main = mach_thread_self(), th1 = pthread_mach_thread_np(t), new_th = MACH_PORT_NULL;
     thread_act_array_t act_list;
     mach_msg_type_number_t act_number;
@@ -163,6 +189,8 @@ int main(void) {
     sleep(3);
     printf("resuming the new thread (mach_port=0x%x) -- if it crashes, check exit signal / crash report\n", (void*)new_th);
     thread_resume(new_th);
+    rv = pthread_kill((pthread_t)(intptr_t)new_struct_addr, SIGUSR1); /* wake up the real thread so it doesn't just sit there */
+    printf("pthread_kill returned %d\n", rv);
 
     for (int i = 0; i < 100 && g_result == -1; i++) usleep(50000);
     printf("result: %s\n",

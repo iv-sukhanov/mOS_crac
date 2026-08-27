@@ -158,22 +158,22 @@ static bool should_capture(mach_vm_address_t addr, mach_vm_size_t size,
         char buf[MAXPATHLEN];
         int ret = proc_regionfilename(getpid(), addr, buf, sizeof(buf));
         if (ret <= 0) return false;
-    } else if (in_shared_cache_submap(addr) || in_shared_cache_range(addr)) {
-        /* Caught what external_pager alone misses (2026-08-21, found from a
-         * real restore failure -- EACCES on mmap(MAP_FIXED), a different
-         * signature than the usual malloc-guard-page ENOMEM): a shared-
-         * cache page that's been privatized via copy-on-write reports
-         * external_pager=0 (genuinely private now, at the VM level), so the
-         * branch above never even runs for it. Two checks, not one: some
-         * such pages stay nested in the cache's own submap (caught by
-         * in_shared_cache_submap), others fully detach from it (caught only
-         * by the address-range check) -- both observed directly on this
-         * machine for what vmmap itself labels the same way either case.
-         * It's dyld/libSystem's own internal artifact of how the loader
-         * happened to privatize one page, not anything the checkpointed
-         * program logically depends on; the restoring process's own fresh
-         * dyld privatizes its own copy the same way if it ever needs to. */
-        return false;
+    // } else if (in_shared_cache_submap(addr) || in_shared_cache_range(addr)) {
+    //     /* Caught what external_pager alone misses (2026-08-21, found from a
+    //      * real restore failure -- EACCES on mmap(MAP_FIXED), a different
+    //      * signature than the usual malloc-guard-page ENOMEM): a shared-
+    //      * cache page that's been privatized via copy-on-write reports
+    //      * external_pager=0 (genuinely private now, at the VM level), so the
+    //      * branch above never even runs for it. Two checks, not one: some
+    //      * such pages stay nested in the cache's own submap (caught by
+    //      * in_shared_cache_submap), others fully detach from it (caught only
+    //      * by the address-range check) -- both observed directly on this
+    //      * machine for what vmmap itself labels the same way either case.
+    //      * It's dyld/libSystem's own internal artifact of how the loader
+    //      * happened to privatize one page, not anything the checkpointed
+    //      * program logically depends on; the restoring process's own fresh
+    //      * dyld privatizes its own copy the same way if it ever needs to. */
+    //     return false;
     }
     return true;
 }

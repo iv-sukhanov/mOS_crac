@@ -9,7 +9,7 @@ RETRY_NUMBER ?= 1
 $(BINDIR)/%: %.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign thread-capture thread-restore thread-run
+.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign thread-capture thread-restore thread-run cache-cow-probe
 
 checkpoint: $(BINDIR)/sim_checkpoint_test
 	$(BINDIR)/sim_checkpoint_test checkpoint $(CKPT_FILE)
@@ -102,6 +102,13 @@ thread-restore: thread_restore_test.c $(BINDIR)/spawn_noaslr
 	$(BINDIR)/spawn_noaslr -r $(RETRY_NUMBER) $(BINDIR)/thread_restore_test $(CKPT_FILE)
 
 thread-run: thread-capture thread-restore
+
+
+# Does MAP_FIXED (and the malloc-guard-page VM-call battery) behave
+# differently against a shared-cache __DATA page before vs. after it's
+# been copy-on-write-privatized by a real write? (2026-08-26 discussion)
+cache-cow-probe: $(BINDIR)/cache_data_cow_test
+	$(BINDIR)/cache_data_cow_test
 
 clean:
 	rm -f $(CKPT_FILE)

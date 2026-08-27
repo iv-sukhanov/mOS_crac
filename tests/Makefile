@@ -9,7 +9,7 @@ RETRY_NUMBER ?= 1
 $(BINDIR)/%: %.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign thread-capture thread-restore thread-run cache-cow-probe
+.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello freestanding-spin resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign thread-capture thread-restore thread-run cache-cow-probe
 
 checkpoint: $(BINDIR)/sim_checkpoint_test
 	$(BINDIR)/sim_checkpoint_test checkpoint $(CKPT_FILE)
@@ -67,6 +67,28 @@ freestanding-hello: freestanding_hello.s strip_lc_load_dylib.py
 	python3 strip_lc_load_dylib.py $(BINDIR)/freestanding_hello
 	codesign -s - -f $(BINDIR)/freestanding_hello
 	$(BINDIR)/freestanding_hello
+
+# Same idea as freestanding-hello, but the binary spins forever after its
+# write() instead of exit()ing -- exiting immediately makes it impossible to
+# vmmap the live process. Launches it backgrounded, vmmaps it (both the
+# summary and the specific MALLOC/__TEXT/__DATA/__OBJC lines that answer
+# "did libSystem load anyway"), then kills it. See NOTES.md 2026-08-21/
+# 2026-08-27.
+freestanding-spin: freestanding_spin.s strip_lc_load_dylib.py
+	$(CC) -c -target arm64-apple-macos11 -o $(BINDIR)/freestanding_spin.o freestanding_spin.s
+	ld -o $(BINDIR)/freestanding_spin $(BINDIR)/freestanding_spin.o -e _start -arch arm64 \
+		-platform_version macos 11.0 11.0 \
+		-syslibroot "$$(xcrun --sdk macosx --show-sdk-path)" -lSystem
+	python3 strip_lc_load_dylib.py $(BINDIR)/freestanding_spin
+	codesign -s - -f $(BINDIR)/freestanding_spin
+	$(BINDIR)/freestanding_spin & \
+	PID=$$!; \
+	sleep 1; \
+	echo "pid=$$PID"; \
+	vmmap -summary $$PID; \
+	echo "--- MALLOC / __TEXT / __DATA / __OBJC lines ---"; \
+	vmmap -interleaved $$PID | grep -iE "malloc guard|malloc metadata|malloc zone|__TEXT|__DATA|__OBJC"; \
+	kill -9 $$PID
 
 # Whole-process capture, single-threaded target (docs/006 "Part 1"). Runs
 # in the foreground and keeps going after the checkpoint is written -- Ctrl-C

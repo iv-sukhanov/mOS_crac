@@ -9,7 +9,7 @@ RETRY_NUMBER ?= 1
 $(BINDIR)/%: %.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello freestanding-spin resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign thread-capture thread-restore thread-run cache-cow-probe
+.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello freestanding-spin resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign thread-capture thread-restore thread-run cache-cow-probe reserve-probe
 
 checkpoint: $(BINDIR)/sim_checkpoint_test
 	$(BINDIR)/sim_checkpoint_test checkpoint $(CKPT_FILE)
@@ -131,6 +131,32 @@ thread-run: thread-capture thread-restore
 # been copy-on-write-privatized by a real write? (2026-08-26 discussion)
 cache-cow-probe: $(BINDIR)/cache_data_cow_test
 	$(BINDIR)/cache_data_cow_test
+
+# Grows __DATA_CONST's vmsize past its filesize (BSS-style reservation,
+# same trick __PAGEZERO already uses) and moves __LINKEDIT's vmaddr out of
+# the way to make room, on an ordinary dynamically-linked C binary -- see
+# reserve_hello.c / extend_segment_vmsize.py. Confirms the reservation
+# holds (the process reads from inside it) and that malloc lands its own
+# regions well past it (vmmap from outside, zero collision). Recompiles
+# reserve_hello.c fresh every run rather than depending on the generic
+# $(BINDIR)/% rule -- patching updates the binary's mtime past the
+# source's, so a stale-prerequisite build would silently re-patch an
+# already-patched binary on a second run. See NOTES.md 2026-08-28.
+reserve-probe: reserve_hello.c extend_segment_vmsize.py $(BINDIR)/spawn_noaslr
+	$(CC) $(CFLAGS) -o $(BINDIR)/reserve_hello reserve_hello.c
+	@VMSIZE_VAL=$(VMSIZE); \
+	VMADDR_VAL=$$(printf "0x%x" $$(($$VMSIZE_VAL + 0x100008000))); \
+	python3 extend_segment_vmsize.py $(BINDIR)/reserve_hello __DATA_CONST vmsize=$$VMSIZE_VAL; \
+	python3 extend_segment_vmsize.py $(BINDIR)/reserve_hello __LINKEDIT vmaddr=$$VMADDR_VAL
+	codesign -s - -f $(BINDIR)/reserve_hello 2>&1 | tail -1
+	$(BINDIR)/spawn_noaslr $(BINDIR)/reserve_hello > /tmp/reserve_hello.out & \
+	SHELL_PID=$$!; \
+	sleep 1; \
+	CHILD_PID=$$(pgrep -P $$SHELL_PID -f reserve_hello); \
+	echo "child pid=$$CHILD_PID"; \
+	vmmap -interleaved $$CHILD_PID 2>&1 | grep -E "^__TEXT|^__DATA|^__LINKEDIT|MALLOC guard|MALLOC metadata|MALLOC_TINY|MALLOC_SMALL" | head -20 | tee ../tmps/reserve_hello.vmmap; \
+# 	kill -9 $$CHILD_PID $$SHELL_PID 2>/dev/null; \
+	cat /tmp/reserve_hello.out
 
 clean:
 	rm -f $(CKPT_FILE)

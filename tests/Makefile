@@ -9,7 +9,7 @@ RETRY_NUMBER ?= 1
 $(BINDIR)/%: %.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello freestanding-spin resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign thread-capture thread-restore thread-run cache-cow-probe reserve-probe
+.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello freestanding-spin resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign thread-capture thread-restore thread-run cache-cow-probe reserve-probe full-run-reserved
 
 checkpoint: $(BINDIR)/sim_checkpoint_test
 	$(BINDIR)/sim_checkpoint_test checkpoint $(CKPT_FILE)
@@ -97,9 +97,15 @@ full-capture: $(BINDIR)/full_capture_test
 	$(BINDIR)/full_capture_test $(CKPT_FILE)
 
 full-noaslr-restore: $(BINDIR)/full_restore_test $(BINDIR)/spawn_noaslr
-	$(BINDIR)/spawn_noaslr -r $(RETRY_NUMBER) $(BINDIR)/full_restore_test $(CKPT_FILE)
+	$(BINDIR)/spawn_noaslr $(BINDIR)/full_restore_test $(CKPT_FILE)
 
 full-run: full-capture full-noaslr-restore
+
+full-run-reserved: full-capture $(BINDIR)/full_restore_test $(BINDIR)/spawn_noaslr
+	python3 extend_segment_vmsize.py $(BINDIR)/full_restore_test __DATA vmsize=0x50004000
+	python3 extend_segment_vmsize.py $(BINDIR)/full_restore_test __LINKEDIT vmaddr=0x15000c000
+	codesign -s - -f $(BINDIR)/full_restore_test
+	$(BINDIR)/spawn_noaslr $(BINDIR)/full_restore_test $(CKPT_FILE)
 
 # bsdthread_create_test.c's current round (docs/007, 2026-08-24/25) calls
 # ptrauth_sign_unauthenticated/ptrauth_auth_data directly -- those intrinsics

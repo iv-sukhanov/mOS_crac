@@ -63,6 +63,7 @@ typedef struct {
     regs_t   regs;
 } checkpoint_header_t;
 
+static bool is_restore;
 static region_desc_t g_regions[MAX_REGIONS];
 static uint32_t g_region_count;
 static regs_t g_regs;
@@ -158,22 +159,22 @@ static bool should_capture(mach_vm_address_t addr, mach_vm_size_t size,
         char buf[MAXPATHLEN];
         int ret = proc_regionfilename(getpid(), addr, buf, sizeof(buf));
         if (ret <= 0) return false;
-    // } else if (in_shared_cache_submap(addr) || in_shared_cache_range(addr)) {
-    //     /* Caught what external_pager alone misses (2026-08-21, found from a
-    //      * real restore failure -- EACCES on mmap(MAP_FIXED), a different
-    //      * signature than the usual malloc-guard-page ENOMEM): a shared-
-    //      * cache page that's been privatized via copy-on-write reports
-    //      * external_pager=0 (genuinely private now, at the VM level), so the
-    //      * branch above never even runs for it. Two checks, not one: some
-    //      * such pages stay nested in the cache's own submap (caught by
-    //      * in_shared_cache_submap), others fully detach from it (caught only
-    //      * by the address-range check) -- both observed directly on this
-    //      * machine for what vmmap itself labels the same way either case.
-    //      * It's dyld/libSystem's own internal artifact of how the loader
-    //      * happened to privatize one page, not anything the checkpointed
-    //      * program logically depends on; the restoring process's own fresh
-    //      * dyld privatizes its own copy the same way if it ever needs to. */
-    //     return false;
+    } else if (in_shared_cache_submap(addr) || in_shared_cache_range(addr)) {
+        /* Caught what external_pager alone misses (2026-08-21, found from a
+         * real restore failure -- EACCES on mmap(MAP_FIXED), a different
+         * signature than the usual malloc-guard-page ENOMEM): a shared-
+         * cache page that's been privatized via copy-on-write reports
+         * external_pager=0 (genuinely private now, at the VM level), so the
+         * branch above never even runs for it. Two checks, not one: some
+         * such pages stay nested in the cache's own submap (caught by
+         * in_shared_cache_submap), others fully detach from it (caught only
+         * by the address-range check) -- both observed directly on this
+         * machine for what vmmap itself labels the same way either case.
+         * It's dyld/libSystem's own internal artifact of how the loader
+         * happened to privatize one page, not anything the checkpointed
+         * program logically depends on; the restoring process's own fresh
+         * dyld privatizes its own copy the same way if it ever needs to. */
+        return false;
     }
     return true;
 }
@@ -279,7 +280,8 @@ static int do_checkpoint(const char* path, void* heap_val_addr) {
     printf("  heap_val self-check: live=%d captured=%d (%s)\n",
            live_val, captured_val, live_val == captured_val ? "MATCH" : "MISMATCH");
 
-    if (live_val == captured_val) {
+    is_restore = !(live_val == captured_val);
+    if (!is_restore) {
         FILE* f = fopen(path, "wb");
         if (!f) { perror("fopen"); return 1; }
         checkpoint_header_t hdr = { .region_count = g_region_count, .regs = g_regs, .capture_used = g_capture_used };
@@ -325,7 +327,10 @@ int main(int argc, char** argv) {
             times++;
         }
 
-        if (times > 4) exit(0); /* exit normally after a few iterations, so the test harness doesn't think it hung */
+        if (times > 4) {
+            if (is_restore) pause();    
+            exit(0);
+        } /* exit normally after a few iterations, so the test harness doesn't think it hung */
     }
     return 0; /* unreachable */
 }

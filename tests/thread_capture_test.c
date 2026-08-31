@@ -110,12 +110,27 @@ static bool should_capture(mach_vm_address_t addr, mach_vm_size_t size,
     uint64_t buf_hi = buf_lo + CAPTURE_BUF_BYTES;
     if ((uint64_t)addr < buf_hi && buf_lo < (uint64_t)addr + size) return false;
 
+    if (in_shared_cache_submap(addr) || in_shared_cache_range(addr)) {
+        /* Changed 2026-08-31: was an unconditional `return false`. Now capture
+         * the cache pages this process actually MODIFIED -- writable, non-exec,
+         * with dirty pages. That's libSystem's per-process __DATA divergence,
+         * and the pthread linked list (__pthread_head / _pthread_list_lock, plus
+         * the main thread's own struct pthread) lives in it -- the thing mode-D
+         * restore needs to make a recreated thread visible to pthread_kill.
+         * Skip r-x code, r-- __DATA_CONST/__LINKEDIT (frozen after dyld fixups,
+         * and cache __LINKEDIT alone is ~570MB), and clean (dirty==0) cache
+         * regions -- those are untouched shared cache, identical in every
+         * process, nothing to transfer. Measured live: this admits ~2 regions,
+         * ~42MB of extent (mostly non-resident), vs ~170MB if the dirty check
+         * is dropped. */
+        return (info->protection & VM_PROT_WRITE)
+            && !(info->protection & VM_PROT_EXECUTE)
+            && info->pages_dirtied > 0;
+    }
     if (info->external_pager) {
         char buf[MAXPATHLEN];
         int ret = proc_regionfilename(getpid(), addr, buf, sizeof(buf));
         if (ret <= 0) return false;
-    } else if (in_shared_cache_submap(addr) || in_shared_cache_range(addr)) {
-        return false;
     }
     return true;
 }

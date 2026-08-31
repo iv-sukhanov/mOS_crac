@@ -127,6 +127,9 @@ thread-capture: $(BINDIR)/thread_capture_test
 
 thread-restore: thread_restore_test.c $(BINDIR)/spawn_noaslr
 	$(CC) $(CFLAGS) -arch arm64e -o $(BINDIR)/thread_restore_test thread_restore_test.c
+	python3 extend_segment_vmsize.py $(BINDIR)/thread_restore_test __DATA vmsize=0x50004000
+	python3 extend_segment_vmsize.py $(BINDIR)/thread_restore_test __LINKEDIT vmaddr=0x15000c000
+	codesign -s - -f $(BINDIR)/thread_restore_test
 	$(BINDIR)/spawn_noaslr -r $(RETRY_NUMBER) $(BINDIR)/thread_restore_test $(CKPT_FILE)
 
 thread-run: thread-capture thread-restore

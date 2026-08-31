@@ -40,7 +40,9 @@
 #include <errno.h>
 #include <signal.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <mach/thread_state.h>
+#include <mach-o/dyld_images.h>
 #include <sys/mman.h>
 
 #if !__has_feature(ptrauth_calls)
@@ -88,14 +90,49 @@ static region_desc_t g_regions[MAX_REGIONS];
  * note on g_capture_buf for the full explanation). */
 static uint8_t* g_capture_buf;
 static const uint64_t g_capture_buf_cap = CAPTURE_BUF_BYTES;
+/* Byte offset of each region's data within g_capture_buf (prefix sum of
+ * g_regions[].len). Filled once in do_restore() after the region list is read.
+ * Both remap passes index the buffer by this instead of a running counter, so
+ * one pass skipping a region can't desync the other's buffer position. */
+static uint64_t g_region_off[MAX_REGIONS];
 
-/* --- remap_regions(): verbatim from full_restore_test.c (2026-08-21) --- */
+/* --- shared-cache membership: verbatim from thread_capture_test.c --- */
+static bool in_shared_cache_submap(mach_vm_address_t addr) {
+    mach_vm_address_t a = addr;
+    mach_vm_size_t size = 0;
+    natural_t depth = 0;
+    vm_region_submap_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+    kern_return_t kr = mach_vm_region_recurse(mach_task_self(), &a, &size, &depth,
+                                               (vm_region_recurse_info_t)&info, &count);
+    return kr == KERN_SUCCESS && info.is_submap;
+}
+
+#define CACHE_SPAN_BYTES (8ull * 1024 * 1024 * 1024)
+static bool in_shared_cache_range(mach_vm_address_t addr) {
+    task_dyld_info_data_t info;
+    mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&info, &count) != KERN_SUCCESS) return false;
+    struct dyld_all_image_infos* infos = (struct dyld_all_image_infos*)(uintptr_t)info.all_image_info_addr;
+    uint64_t base = (uint64_t)infos->sharedCacheBaseAddress;
+    return base != 0 && (uint64_t)addr >= base && (uint64_t)addr < base + CACHE_SPAN_BYTES;
+}
+
+static bool is_cache_region(uint64_t addr) {
+    return in_shared_cache_range((mach_vm_address_t)addr) || in_shared_cache_submap((mach_vm_address_t)addr);
+}
+
+/* --- remap_regions(): verbatim from full_restore_test.c (2026-08-21), plus a
+ * skip for shared-cache regions -- those are handled later by
+ * remap_cache_regions(), after the worker thread exists (see do_restore). --- */
 static int remap_regions(uint32_t region_count) {
-    uint64_t offset = 0;
     for (uint32_t i = 0; i < region_count; i++) {
         uint64_t addr = g_regions[i].addr;
         uint64_t len = g_regions[i].len;
         int prot = (int)g_regions[i].protection;
+        uint64_t offset = g_region_off[i];
+
+        if (is_cache_region(addr)) continue; /* deferred to remap_cache_regions() */
 
         void* got = mmap((void*)(uintptr_t)addr, len, PROT_READ | PROT_WRITE,
                          MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
@@ -116,7 +153,6 @@ static int remap_regions(uint32_t region_count) {
         }
 
         memcpy(got, g_capture_buf + offset, len);
-        offset += len;
 
         if (prot != (PROT_READ | PROT_WRITE) && mprotect(got, len, prot) != 0) {
             fprintf(stderr, "mprotect failed for region[%u] [0x%llx,0x%llx): %s\n",
@@ -125,6 +161,42 @@ static int remap_regions(uint32_t region_count) {
         }
     }
     return 0;
+}
+
+/* Second remap pass: the shared-cache regions remap_regions() skipped. Run
+ * AFTER the worker thread is created + suspended + state-seeded (see
+ * do_restore) so __bsdthread_create / pthread_self / malloc all ran against
+ * this process's own intact libpthread+libmalloc __DATA -- only thread_resume
+ * sees the replayed state. A region that won't map (kernel-sealed cache pages,
+ * region[15]-style) is printed and skipped, never fatal: the replay is
+ * partial by design. */
+static void remap_cache_regions(uint32_t region_count) {
+    unsigned applied = 0, skipped = 0;
+    for (uint32_t i = 0; i < region_count; i++) {
+        uint64_t addr = g_regions[i].addr;
+        uint64_t len = g_regions[i].len;
+        int prot = (int)g_regions[i].protection;
+        uint64_t offset = g_region_off[i];
+
+        if (!is_cache_region(addr)) continue;
+
+        void* got = mmap((void*)(uintptr_t)addr, len, PROT_READ | PROT_WRITE,
+                         MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
+        if (got == MAP_FAILED || (uint64_t)(uintptr_t)got != addr) {
+            fprintf(stderr, "  skipped cache region[%u] addr=0x%llx size=0x%llx prot=%d : %s\n",
+                    i, (unsigned long long)addr, (unsigned long long)len, prot,
+                    got == MAP_FAILED ? strerror(errno) : "fixed address not honored");
+            skipped++;
+            continue;
+        }
+        memcpy(got, g_capture_buf + offset, len);
+        if (prot != (PROT_READ | PROT_WRITE) && mprotect(got, len, prot) != 0) {
+            fprintf(stderr, "  cache region[%u] addr=0x%llx mapped+copied but mprotect(%d) failed: %s\n",
+                    i, (unsigned long long)addr, prot, strerror(errno));
+        }
+        applied++;
+    }
+    // printf("remap_cache_regions: %u applied, %u skipped\n", applied, skipped);
 }
 
 /* --- mode D: self-sign + suspended-create + task_threads() + set_state --- */
@@ -195,7 +267,10 @@ static int do_restore(const char* path) {
         fprintf(stderr, "short read on region descriptors\n"); fclose(f); return 1;
     }
     uint64_t region_total = 0;
-    for (uint32_t i = 0; i < hdr.region_count; i++) region_total += g_regions[i].len;
+    for (uint32_t i = 0; i < hdr.region_count; i++) {
+        g_region_off[i] = region_total;
+        region_total += g_regions[i].len;
+    }
     if (region_total != hdr.capture_used) { fprintf(stderr, "corrupt checkpoint file\n"); fclose(f); return 1; }
     if (fread(g_capture_buf, 1, hdr.capture_used, f) != hdr.capture_used) {
         fprintf(stderr, "short read on capture buffer\n"); fclose(f); return 1;
@@ -310,12 +385,28 @@ static int do_restore(const char* path) {
     kr = thread_set_state(worker_port, ARM_NEON_STATE64, (thread_state_t)&g_regs.neon, ARM_NEON_STATE64_COUNT);
     if (kr != KERN_SUCCESS) { fprintf(stderr, "thread_set_state(NEON) failed: %d\n", kr); }
 
+    /* The experiment (2026-08-31): replay the captured process's libSystem
+     * __DATA now -- worker exists + is suspended + state-seeded, so this only
+     * affects what it sees on resume. The point is __pthread_head /
+     * _pthread_list_lock: if the captured list state lands, the recreated
+     * worker (at its ORIGINAL address, so the captured list's pointer to it is
+     * still valid) becomes visible to pthread_kill from this thread. */
+    remap_cache_regions(hdr.region_count);
+
+    pthread_t worker_pt = (pthread_t)(uintptr_t)hdr.worker_struct_addr;
+    int rc = pthread_kill(worker_pt, 0);
+    printf("pthread_kill(worker=0x%llx, 0) after cache __DATA replay => rc=%d (%s)\n",
+           (unsigned long long)hdr.worker_struct_addr, rc, rc == 0 ? "FOUND -- registered" : strerror(rc));
+
     printf("resuming -- watch for the worker's own periodic prints below "
            "(tls_val should read %d if TPIDR_EL0 seeded correctly)\n", WORKER_TLS_VALUE);
     kr = thread_resume(worker_port);
     if (kr != KERN_SUCCESS) { fprintf(stderr, "thread_resume failed: %d\n", kr); return 1; }
 
     sleep(10);
+    rc = pthread_kill(worker_pt, 0);
+    printf("pthread_kill(worker, 0) after 10s => rc=%d (%s)\n",
+           rc, rc == 0 ? "FOUND -- registered" : strerror(rc));
     return 0;
 }
 

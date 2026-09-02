@@ -277,6 +277,13 @@ __asm__(
 
 static void* dummy_entry_fn(void* arg) { (void)arg; for (;;) pause(); return NULL; }
 
+void handle_signal(int sig, siginfo_t* info, void* ctx) {
+    (void)sig; (void)info; (void)ctx;
+    char buf[] = "got signal 67\n";
+    write(STDOUT_FILENO, buf, sizeof(buf));
+    for (;;) pause();
+}
+
 static int do_restore(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) { perror("fopen"); return 1; }
@@ -328,6 +335,15 @@ static int do_restore(const char* path) {
     void* stack = malloc(STACK_SIZE);
     if (!stack) { perror("malloc stack"); return 1; }
     void* stack_top = (char*)stack + STACK_SIZE;
+
+    struct sigaction sa;
+    sa.sa_sigaction = handle_signal;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGUSR1, &sa, NULL) == -1) {
+        perror("sigaction");
+        return 1;
+    }
 
     errno = 0;
     void* ret = __bsdthread_create(dummy_entry_fn, NULL, stack_top, (void*)worker_addr,
@@ -441,7 +457,7 @@ static int do_restore(const char* path) {
     }
     
     pthread_t worker_pt = (pthread_t)(uintptr_t)hdr.worker_struct_addr;
-    int rc = pthread_kill(worker_pt, 0);
+    int rc = pthread_kill(worker_pt, SIGUSR1);
     /* Raw write(2), not printf/fprintf -- deliberately: remap_cache_regions()
      * just overwrote several unrelated process-dependent (DB-keyed) signed
      * globals scattered through the shared-cache __DATA it blanket-copied,
@@ -458,7 +474,7 @@ static int do_restore(const char* path) {
      * follow-up pass once more of __DATA's signed fields are understood. */
     char buf[160];
     int n = snprintf(buf, sizeof(buf),
-        "pthread_kill(worker=0x%llx, 0) after cache __DATA replay => rc=%d (%s)\n",
+        "pthread_kill(worker=0x%llx, SIGUSR1) after cache __DATA replay => rc=%d (%s)\n",
         (unsigned long long)hdr.worker_struct_addr, rc, rc == 0 ? "FOUND -- registered" : strerror(rc));
     write(2, buf, n > 0 ? (size_t)n : 0);
     /* _exit(), not return/exit() -- an ordinary return here still runs
@@ -466,6 +482,16 @@ static int do_restore(const char* path) {
      * touches the same corrupted __sF[]._write field write(2) above was
      * built to avoid, producing a cosmetic SIGBUS after the real answer is
      * already printed. _exit() skips atexit entirely. */
+
+    kr = thread_resume(worker_port);
+    if (kr != KERN_SUCCESS) {
+        write(2, "thread_resume failed\n", 21);
+        return 1;
+    } else {
+        write(2, "thread_resume succeeded -- worker should now be running\n", 55);
+    }
+
+    sleep(3);
     _exit(0);
 }
 

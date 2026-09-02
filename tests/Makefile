@@ -9,7 +9,7 @@ RETRY_NUMBER ?= 1
 $(BINDIR)/%: %.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello freestanding-spin resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign thread-capture thread-restore thread-run cache-cow-probe reserve-probe full-run-reserved
+.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello freestanding-spin resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign thread-capture thread-restore thread-run cache-cow-probe reserve-probe full-run-reserved lr-sign-probe
 
 checkpoint: $(BINDIR)/sim_checkpoint_test
 	$(BINDIR)/sim_checkpoint_test checkpoint $(CKPT_FILE)
@@ -140,6 +140,22 @@ thread-run: thread-capture thread-restore
 # been copy-on-write-privatized by a real write? (2026-08-26 discussion)
 cache-cow-probe: $(BINDIR)/cache_data_cow_test
 	$(BINDIR)/cache_data_cow_test
+
+# Is the LR signature ARM's PAC puts on the stack process-invariant (like
+# the shared cache's IA-keyed function pointers, confirmed 2026-09-01) or
+# process-dependent (like struct pthread's DB-keyed signature, docs/007)?
+# Two same-boot runs under spawn_noaslr (pins sp, LR's own signing modifier)
+# -- diff the two logs by hand; a differing lr against an identical sp is
+# the answer. NOTES.md 2026-09-01 has the full plan.
+lr-sign-probe: lr_sign_probe.c $(BINDIR)/spawn_noaslr
+	$(CC) $(CFLAGS) -arch arm64e -o $(BINDIR)/lr_sign_probe lr_sign_probe.c
+	$(BINDIR)/spawn_noaslr $(BINDIR)/lr_sign_probe > /tmp/lr_sign_run1.txt
+	$(BINDIR)/spawn_noaslr $(BINDIR)/lr_sign_probe > /tmp/lr_sign_run2.txt
+	@echo "--- run1 ---"; cat /tmp/lr_sign_run1.txt
+	@echo "--- run2 ---"; cat /tmp/lr_sign_run2.txt
+	@diff /tmp/lr_sign_run1.txt /tmp/lr_sign_run2.txt \
+		&& echo "IDENTICAL -- LR signing looks process-invariant" \
+		|| echo "DIFFERS -- LR signing is process-dependent"
 
 # Grows __DATA_CONST's vmsize past its filesize (BSS-style reservation,
 # same trick __PAGEZERO already uses) and moves __LINKEDIT's vmaddr out of

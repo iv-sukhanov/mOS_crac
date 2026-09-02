@@ -109,12 +109,16 @@ static bool in_shared_cache_submap(mach_vm_address_t addr) {
 }
 
 #define CACHE_SPAN_BYTES (8ull * 1024 * 1024 * 1024)
-static bool in_shared_cache_range(mach_vm_address_t addr) {
+static uint64_t shared_cache_base(void) {
     task_dyld_info_data_t info;
     mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
-    if (task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&info, &count) != KERN_SUCCESS) return false;
+    if (task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&info, &count) != KERN_SUCCESS) return 0;
     struct dyld_all_image_infos* infos = (struct dyld_all_image_infos*)(uintptr_t)info.all_image_info_addr;
-    uint64_t base = (uint64_t)infos->sharedCacheBaseAddress;
+    return (uint64_t)infos->sharedCacheBaseAddress;
+}
+
+static bool in_shared_cache_range(mach_vm_address_t addr) {
+    uint64_t base = shared_cache_base();
     return base != 0 && (uint64_t)addr >= base && (uint64_t)addr < base + CACHE_SPAN_BYTES;
 }
 
@@ -200,6 +204,25 @@ static void remap_cache_regions(uint32_t region_count) {
 }
 
 /* --- mode D: self-sign + suspended-create + task_threads() + set_state --- */
+
+/* Same list-lock page as cache_data_cow_test.c / NOTES 2026-08-26:
+ * disassembling pthread_kill shows the munge global living at [page+0x60],
+ * 0xc bytes before _pthread_list_lock ([page+0x6c]) -- both loaded via
+ * `adrp` off the same page. cache_data_cow_test.c hardcoded the *absolute*
+ * address that session (0x1f616406c) as "boot-session-stable" -- true
+ * within one boot, but confirmed FALSE across boots (2026-09-01: this
+ * session's real _pthread_list_lock, via `lldb`'s `p/x &_pthread_list_lock`,
+ * is 0x1f789c06c instead -- the hardcoded value silently pointed at
+ * unrelated, all-zero memory, and the resulting write was a no-op). Fix:
+ * store the offset from the shared cache's *base* instead of an absolute
+ * address -- the whole cache slides as one block per boot, so the offset
+ * of any symbol within it from that base is what's actually stable across
+ * boots, not the absolute address. This offset (0x1f789c06c - 0x18a950000)
+ * still needs re-deriving by hand if Apple ever reshuffles libpthread's
+ * __DATA layout (a toolchain/OS update), same caveat cache_data_cow_test.c
+ * already carries for PTHREAD_HEAD_ADDR. */
+#define PTHREAD_LIST_LOCK_CACHE_OFFSET 0x6cf4c06cull
+#define PTHREAD_MUNGE_CACHE_OFFSET     (PTHREAD_LIST_LOCK_CACHE_OFFSET - 0xc)
 
 /* Same (addr, key, discriminator) triple as libpthread's own
  * _pthread_init_signature/_pthread_validate_signature (docs/007). */
@@ -393,21 +416,57 @@ static int do_restore(const char* path) {
      * still valid) becomes visible to pthread_kill from this thread. */
     remap_cache_regions(hdr.region_count);
 
+    /* remap_cache_regions() just overwrote this whole page with the
+     * CAPTURED process's bytes -- including the munge global `new_sig`
+     * above was signed against, clobbering it with the OTHER process's
+     * value and breaking pthread_kill's internal autdb check (disassembly:
+     * eor x16, x9, x8; autdb x16, x17, where x9 is this global). Patch just
+     * this one word back to THIS process's own live value (`munge`,
+     * recovered above before the clobber) so the signature still validates.
+     * Deliberately scoped to exactly this word, not a general fix -- see
+     * file header. */
+    *(uintptr_t *)(uintptr_t)(shared_cache_base() + PTHREAD_MUNGE_CACHE_OFFSET) = munge;
+
+    mach_port_t mach_port = pthread_mach_thread_np((pthread_t)(uintptr_t)hdr.worker_struct_addr);
+    char buf1[128];
+    if (mach_port != worker_port) {
+        sprintf(buf1, "pthread_mach_thread_np(worker=0x%llx) => 0x%x, expected 0x%x\n",
+                (unsigned long long)hdr.worker_struct_addr, mach_port, worker_port);
+        write(2, buf1, strlen(buf1));
+        return 1;
+    } else {
+        sprintf(buf1, "pthread_mach_thread_np(worker=0x%llx) => 0x%x (matches task_threads)\n",
+                (unsigned long long)hdr.worker_struct_addr, mach_port);
+        write(2, buf1, strlen(buf1));
+    }
+    
     pthread_t worker_pt = (pthread_t)(uintptr_t)hdr.worker_struct_addr;
     int rc = pthread_kill(worker_pt, 0);
-    printf("pthread_kill(worker=0x%llx, 0) after cache __DATA replay => rc=%d (%s)\n",
-           (unsigned long long)hdr.worker_struct_addr, rc, rc == 0 ? "FOUND -- registered" : strerror(rc));
-
-    printf("resuming -- watch for the worker's own periodic prints below "
-           "(tls_val should read %d if TPIDR_EL0 seeded correctly)\n", WORKER_TLS_VALUE);
-    kr = thread_resume(worker_port);
-    if (kr != KERN_SUCCESS) { fprintf(stderr, "thread_resume failed: %d\n", kr); return 1; }
-
-    sleep(10);
-    rc = pthread_kill(worker_pt, 0);
-    printf("pthread_kill(worker, 0) after 10s => rc=%d (%s)\n",
-           rc, rc == 0 ? "FOUND -- registered" : strerror(rc));
-    return 0;
+    /* Raw write(2), not printf/fprintf -- deliberately: remap_cache_regions()
+     * just overwrote several unrelated process-dependent (DB-keyed) signed
+     * globals scattered through the shared-cache __DATA it blanket-copied,
+     * not just the pthread munge patched above. One instance found the hard
+     * way, lldb-confirmed: libc's own __sF[]._write (stdio's FILE-struct
+     * write callback) traps the exact same way pthread_kill did before the
+     * munge patch, the moment anything calls printf/fprintf after this
+     * remap. Scope for NOW is strictly "what does pthread_kill report" --
+     * sidestep stdio entirely (snprintf only formats into a buffer, no FILE*
+     * involved) rather than chase every other clobbered signed global --
+     * that's the bigger, not-yet-solved problem this file's header already
+     * flags for a later rewrite. Stops here on purpose: thread_resume() and
+     * the worker's own prints are untested past this point now, left for a
+     * follow-up pass once more of __DATA's signed fields are understood. */
+    char buf[160];
+    int n = snprintf(buf, sizeof(buf),
+        "pthread_kill(worker=0x%llx, 0) after cache __DATA replay => rc=%d (%s)\n",
+        (unsigned long long)hdr.worker_struct_addr, rc, rc == 0 ? "FOUND -- registered" : strerror(rc));
+    write(2, buf, n > 0 ? (size_t)n : 0);
+    /* _exit(), not return/exit() -- an ordinary return here still runs
+     * exit()'s atexit-registered stdio flush-all-open-streams pass, which
+     * touches the same corrupted __sF[]._write field write(2) above was
+     * built to avoid, producing a cosmetic SIGBUS after the real answer is
+     * already printed. _exit() skips atexit entirely. */
+    _exit(0);
 }
 
 int main(int argc, char** argv) {

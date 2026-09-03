@@ -85,6 +85,13 @@ static bool in_shared_cache_submap(mach_vm_address_t addr) {
     return kr == KERN_SUCCESS && info.is_submap;
 }
 
+/* A generous (not exact) guess at the cache's extent -- the combined
+ * dyld_shared_cache_arm64e[.01/.02] files sum to ~5.6GB on this machine;
+ * 8GB covers that with headroom. Generous is deliberate, not sloppy: this
+ * only ever excludes candidates that already passed every other check, so
+ * a false positive here means capturing a few bytes of cache-adjacent
+ * memory unnecessarily, not missing something real (full_capture_test.c,
+ * 2026-08-21). */
 #define CACHE_SPAN_BYTES (8ull * 1024 * 1024 * 1024)
 static bool in_shared_cache_range(mach_vm_address_t addr) {
     task_dyld_info_data_t info;
@@ -97,7 +104,6 @@ static bool in_shared_cache_range(mach_vm_address_t addr) {
 
 static bool should_capture(mach_vm_address_t addr, mach_vm_size_t size,
                             const vm_region_submap_info_data_64_t* info) {
-    (void)size;
     if (info->protection == VM_PROT_NONE) return false; /* guard pages, VA reservations: nothing to copy */
 
     if (info->external_pager) {
@@ -107,7 +113,16 @@ static bool should_capture(mach_vm_address_t addr, mach_vm_size_t size,
         int ret = proc_regionfilename(getpid(), addr, buf, sizeof(buf));
         if (ret <= 0) return false;
     } else if (in_shared_cache_submap(addr) || in_shared_cache_range(addr)) {
-        return false; /* privatized cache page -- see full_capture_test.c */
+        if (info->protection & VM_PROT_EXECUTE) {
+            /* Not expected in practice (this branch is only reached for
+             * non-external-pager pages, and ordinary cache code should
+             * stay pager-backed/pristine) -- printed so a real occurrence
+             * doesn't pass by silently. */
+            printf("  note: executable, non-external-pager region in shared-cache "
+                   "range at 0x%llx size=0x%llx prot=%u -- capturing, not filtered\n",
+                   (unsigned long long)addr, (unsigned long long)size, info->protection);
+        }
+        return info->protection != VM_PROT_READ; //exclude read-only shared-cache pages 
     }
     return true;
 }

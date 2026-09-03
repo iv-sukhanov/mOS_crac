@@ -24,8 +24,20 @@
  * worker thread. pthread_addr in the header is this (the only) thread's
  * own pthread_self(), for whatever mode-D-style restore eventually wants
  * it.
+ *
+ * Needs -arch arm64e (2026-09-03, Ivan's call): munge (below) needs a real
+ * ptrauth_sign_unauthenticated(), which is compile-time gated on
+ * __has_feature(ptrauth_calls) -- confirmed empirically, not assumed: it
+ * doesn't even compile without -arch arm64e, let alone silently no-op (see
+ * NOTES.md 2026-09-03). Consequence accepted, not yet acted on: captured
+ * pc/sp in regs_t are now genuinely PAC-signed bit patterns (this process
+ * is really arm64e), not the plain raw addresses thread_capture_test.c's
+ * deliberately-non-arm64e captures produce -- correctly interpreting them
+ * on the restore side (strip/resign via the FP chain, per lr_resign_test.c)
+ * is deferred, not done here.
  */
 #include <pthread.h>
+#include <ptrauth.h>
 #include <signal.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -41,6 +53,10 @@
 #include <libproc.h>
 #include <sys/param.h>
 #include <sys/mman.h>
+
+#if !__has_feature(ptrauth_calls)
+#error "build with -arch arm64e -- see file header for why this is required"
+#endif
 
 #define MAX_REGIONS 256
 
@@ -63,6 +79,24 @@ typedef struct {
                                 now, no shared buffer left to size-check against */
     regs_t   regs;
     uint64_t pthread_addr;  /* this thread's own pthread_self(), captured at signal time */
+    uint64_t munge;         /* this thread's own live munge (docs/007 algebra: stored_sig XOR
+                                sign_for_addr(pthread_addr)), captured alongside pthread_addr.
+                                Belongs to THIS (capture) process's own key -- a restore process
+                                must still recompute its OWN munge fresh from its OWN live thread
+                                (thread_restore_test.c already does this correctly, munge/G is
+                                per-process, not portable). Captured anyway, for future use: e.g.
+                                re-interpreting some OTHER munge-XORed signed value that shows up
+                                elsewhere in captured __DATA, which needs the ORIGINAL process's
+                                munge to undo, not the restore process's. Not yet consumed by
+                                anything -- see file header re: -arch arm64e. */
+    uint64_t sentinel;      /* address of a stack-local flag in do_capture() (Ivan, 2026-09-03):
+                                since this thread self-signals then keeps running the same code
+                                (matching full_capture_test.c's pattern), a restore that resumes
+                                this checkpoint by seeding PC back to right after raise() would
+                                otherwise fall straight into fopen/fwrite again and re-write a
+                                checkpoint. Restore pokes a 1 at this exact address (the stack
+                                region restores it to the captured 0 first); do_capture() checks
+                                it right after raise() and skips writing if it's no longer 0. */
 } checkpoint_header_t;
 
 static region_desc_t g_regions[MAX_REGIONS];
@@ -71,6 +105,17 @@ static void*         g_region_bufs[MAX_REGIONS];
 static uint32_t      g_region_count;
 static regs_t        g_regs;
 static uint64_t      g_pthread_addr;
+static uint64_t      g_munge;
+
+/* Same (addr, key, discriminator) triple as libpthread's own
+ * _pthread_init_signature/_pthread_validate_signature (docs/007), and as
+ * thread_restore_test.c's own copy -- must match exactly, this is what
+ * makes the XOR algebra below actually recover the real munge/G. */
+static uintptr_t sign_for_addr(uintptr_t addr) {
+    return (uintptr_t)ptrauth_sign_unauthenticated(
+        (void *)addr, ptrauth_key_process_dependent_data,
+        ptrauth_string_discriminator("pthread.signature"));
+}
 
 /* --- region classification: verbatim from full_capture_test.c (2026-08-21) --- */
 
@@ -102,8 +147,7 @@ static bool in_shared_cache_range(mach_vm_address_t addr) {
     return base != 0 && (uint64_t)addr >= base && (uint64_t)addr < base + CACHE_SPAN_BYTES;
 }
 
-static bool should_capture(mach_vm_address_t addr, mach_vm_size_t size,
-                            const vm_region_submap_info_data_64_t* info) {
+static bool should_capture(mach_vm_address_t addr, const vm_region_submap_info_data_64_t* info) {
     if (info->protection == VM_PROT_NONE) return false; /* guard pages, VA reservations: nothing to copy */
 
     if (info->external_pager) {
@@ -119,8 +163,8 @@ static bool should_capture(mach_vm_address_t addr, mach_vm_size_t size,
              * stay pager-backed/pristine) -- printed so a real occurrence
              * doesn't pass by silently. */
             printf("  note: executable, non-external-pager region in shared-cache "
-                   "range at 0x%llx size=0x%llx prot=%u -- capturing, not filtered\n",
-                   (unsigned long long)addr, (unsigned long long)size, info->protection);
+                   "range at 0x%llx prot=%u -- capturing, not filtered\n",
+                   (uint64_t)addr, info->protection);
         }
         return info->protection != VM_PROT_READ; //exclude read-only shared-cache pages 
     }
@@ -140,7 +184,7 @@ static void classify_regions(void) {
                                                    (vm_region_recurse_info_t)&info, &count);
         if (kr != KERN_SUCCESS) break;
 
-        if (should_capture(a, size, &info)) {
+        if (should_capture(a, &info)) {
             g_regions[g_region_count].addr = a;
             g_regions[g_region_count].len = size;
             g_regions[g_region_count].protection = (uint32_t)info.protection;
@@ -165,12 +209,28 @@ static int allocate_region_bufs(void) {
                           MAP_ANON | MAP_PRIVATE, -1, 0);
         if (buf == MAP_FAILED) {
             fprintf(stderr, "mmap failed for region[%u] buffer (%llu bytes): %s\n",
-                    i, (unsigned long long)g_regions[i].len, strerror(errno));
+                    i, (uint64_t)g_regions[i].len, strerror(errno));
             return 1;
         }
         g_region_bufs[i] = buf;
     }
     return 0;
+}
+
+/* Release the per-region buffers once they're written out. Not strictly
+ * necessary for a one-shot driver that exits right after do_capture()
+ * returns (the OS reclaims everything on exit either way) -- but
+ * do_capture() is meant to be reusable across different test scenarios,
+ * some of which may call it more than once or keep running afterward, so
+ * leaking tens of MB of anonymous mappings per call would be a real,
+ * accumulating problem there. */
+static void free_region_bufs(void) {
+    for (uint32_t i = 0; i < g_region_count; i++) {
+        if (g_region_bufs[i]) {
+            munmap(g_region_bufs[i], g_regions[i].len);
+            g_region_bufs[i] = NULL;
+        }
+    }
 }
 
 /* Signal handler: registers + memcpy of each already-classified region into
@@ -182,6 +242,8 @@ static void capture_state(int sig, siginfo_t* info, void* ctx) {
     g_regs.neon  = ((ucontext_t*)ctx)->uc_mcontext->__ns;
     __asm__ volatile ("mrs %0, tpidr_el0" : "=r" (g_regs.tpidr));
     g_pthread_addr = (uint64_t)(uintptr_t)pthread_self();
+    uintptr_t stored_sig = *(uintptr_t *)(uintptr_t)g_pthread_addr;
+    g_munge = stored_sig ^ sign_for_addr((uintptr_t)g_pthread_addr);
 
     for (uint32_t i = 0; i < g_region_count; i++) {
         memcpy(g_region_bufs[i], (void*)(uintptr_t)g_regions[i].addr, g_regions[i].len);
@@ -193,6 +255,16 @@ static void capture_state(int sig, siginfo_t* info, void* ctx) {
  * thread/stack) -> write file. No worker thread -- pthread_addr in the
  * header is THIS (the only) thread's own pthread_self(). */
 int do_capture(const char* path) {
+    /* volatile: must force a real memory load on every check below, not a
+     * cached register value from before raise(). A restored thread's
+     * registers come from thread_set_state()'s copied GPRs, seeded from
+     * whatever was resident at capture time -- if this value had been
+     * sitting in a register rather than reloaded from the stack, resume
+     * would see that stale cached value forever, never the fresh 1 a
+     * restore process pokes into the actual stack slot. */
+    volatile int restored_flag = 0;
+    uint64_t sentinel = (uint64_t)(uintptr_t)&restored_flag;
+
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_flags = SA_SIGINFO;
@@ -204,11 +276,11 @@ int do_capture(const char* path) {
     for (uint32_t i = 0; i < g_region_count; i++) {
         total += g_regions[i].len;
         printf("  region[%u] [0x%llx,0x%llx) %.2fMB prot=%u\n", i,
-               (unsigned long long)g_regions[i].addr,
-               (unsigned long long)(g_regions[i].addr + g_regions[i].len),
-               g_regions[i].len / 1048576.0, g_regions[i].protection);
+               (uint64_t)g_regions[i].addr,
+               (uint64_t)(g_regions[i].addr + g_regions[i].len),
+               g_regions[i].len / (1024.0 * 1024.0), g_regions[i].protection);
     }
-    printf("classified %u regions, %.2f MB total\n", g_region_count, total / 1048576.0);
+    printf("classified %u regions, %.2f MB total\n", g_region_count, total / (1024.0 * 1024.0));
 
     if (allocate_region_bufs() != 0) return 1;
 
@@ -216,18 +288,37 @@ int do_capture(const char* path) {
                         thread/stack, then execution just continues here
                         (matches full_capture_test.c) */
 
-    printf("captured %u regions, %.2f MB, pc=0x%llx sp=0x%llx tpidr=0x%llx pthread_addr=0x%llx\n",
-           g_region_count, total / 1048576.0,
-           (unsigned long long)g_regs.gregs.__pc, (unsigned long long)g_regs.gregs.__sp,
-           (unsigned long long)g_regs.tpidr, (unsigned long long)g_pthread_addr);
+    /* A restore that resumes this exact checkpoint seeds PC back to right
+     * here (or thereabouts) and pokes a 1 into *sentinel before doing so --
+     * see checkpoint_header_t's own comment. Skip re-writing a checkpoint
+     * in that case; a genuinely fresh call to do_capture() later gets its
+     * own new stack frame and a fresh restored_flag=0, so no reset needed. */
+    if (restored_flag != 0) {
+        printf("resumed from a restore -- not writing a checkpoint again\n");
+        free_region_bufs();
+        return 0;
+    }
+
+    /* arm64e's arm_thread_state64_t has no plain __pc/__sp fields -- pc/sp
+     * are opaque (ptrauth-signed), need the real accessor macros, not raw
+     * field access (thread_restore_test.c's own plain-cast reads only work
+     * because ITS source bytes come from a plain-arm64 capture file; this
+     * process's own live gregs here genuinely are signed). */
+    printf("captured %u regions, %.2f MB, pc=%p sp=%p tpidr=0x%llx pthread_addr=0x%llx munge=0x%llx\n",
+           g_region_count, total / (1024.0 * 1024.0),
+           arm_thread_state64_get_pc_fptr(g_regs.gregs),
+           (void*)arm_thread_state64_get_sp(g_regs.gregs),
+           (uint64_t)g_regs.tpidr, (uint64_t)g_pthread_addr, (uint64_t)g_munge);
 
     FILE* f = fopen(path, "wb");
-    if (!f) { perror("fopen"); return 1; }
+    if (!f) { perror("fopen"); free_region_bufs(); return 1; }
     checkpoint_header_t hdr = {
         .region_count = g_region_count,
         .capture_used = total,
         .regs = g_regs,
         .pthread_addr = g_pthread_addr,
+        .munge = g_munge,
+        .sentinel = sentinel,
     };
     fwrite(&hdr, sizeof(hdr), 1, f);
     fwrite(g_regions, sizeof(region_desc_t), g_region_count, f);
@@ -235,7 +326,8 @@ int do_capture(const char* path) {
         fwrite(g_region_bufs[i], 1, g_regions[i].len, f);
     }
     fclose(f);
-    printf("checkpoint written to %s (pthread_addr=0x%llx)\n", path, (unsigned long long)g_pthread_addr);
+    printf("checkpoint written to %s (pthread_addr=0x%llx)\n", path, (uint64_t)g_pthread_addr);
 
+    free_region_bufs();
     return 0;
 }

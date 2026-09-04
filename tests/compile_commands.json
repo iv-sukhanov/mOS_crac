@@ -365,6 +365,22 @@
   },
   {
     "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "thread_state_resign_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-arch",
+      "arm64e",
+      "-c",
+      "thread_state_resign_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
     "file": "thread_suspend_lock_test.c",
     "arguments": [
       "/usr/bin/clang",

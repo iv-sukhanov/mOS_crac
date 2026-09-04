@@ -9,7 +9,7 @@ RETRY_NUMBER ?= 1
 $(BINDIR)/%: %.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello freestanding-spin resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign thread-capture thread-restore thread-run cache-cow-probe reserve-probe full-run-reserved lr-sign-probe cr-capture cr-restore cr-run ucontext-reg-sign
+.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello freestanding-spin resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign thread-capture thread-restore thread-run cache-cow-probe reserve-probe full-run-reserved lr-sign-probe cr-capture cr-restore cr-run ucontext-reg-sign thread-state-resign
 
 checkpoint: $(BINDIR)/sim_checkpoint_test
 	$(BINDIR)/sim_checkpoint_test checkpoint $(CKPT_FILE)
@@ -214,6 +214,14 @@ reserve-probe: reserve_hello.c extend_segment_vmsize.py $(BINDIR)/spawn_noaslr
 ucontext-reg-sign: ucontext_reg_sign_test.c
 	$(CC) $(CFLAGS) -arch arm64e -o $(BINDIR)/ucontext_reg_sign_test ucontext_reg_sign_test.c
 	$(BINDIR)/ucontext_reg_sign_test
+
+# Strip+resign round trip against a real thread_get_state()/set_state()
+# (2026-09-04, docs/010) -- single-process, locks down the recipe itself
+# (key/discriminator/flags) before ever trying it cross-process. Needs
+# -arch arm64e for the same reason every PAC-aware file in this repo does.
+thread-state-resign: thread_state_resign_test.c
+	$(CC) $(CFLAGS) -arch arm64e -o $(BINDIR)/thread_state_resign_test thread_state_resign_test.c
+	$(BINDIR)/thread_state_resign_test
 
 clean:
 	rm -f $(CKPT_FILE)

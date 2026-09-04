@@ -9,7 +9,7 @@ RETRY_NUMBER ?= 1
 $(BINDIR)/%: %.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello freestanding-spin resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign thread-capture thread-restore thread-run cache-cow-probe reserve-probe full-run-reserved lr-sign-probe
+.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello freestanding-spin resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign thread-capture thread-restore thread-run cache-cow-probe reserve-probe full-run-reserved lr-sign-probe cr-capture cr-restore cr-run
 
 checkpoint: $(BINDIR)/sim_checkpoint_test
 	$(BINDIR)/sim_checkpoint_test checkpoint $(CKPT_FILE)
@@ -134,6 +134,27 @@ thread-restore: thread_restore_test.c $(BINDIR)/spawn_noaslr
 
 thread-run: thread-capture thread-restore
 
+# cr_test.c's do_capture(), single-threaded self-capture (2026-09-03) --
+# needs -arch arm64e itself now (unlike thread_capture_test.c), so this
+# gets an _e suffix like the arm64e capture builds used ad hoc this
+# session, distinguishing it from any future plain-arm64 cr_* build.
+cr-capture: cr_capture_driver.c
+	$(CC) $(CFLAGS) -arch arm64e -o $(BINDIR)/cr_capture_driver_e cr_capture_driver.c
+	$(BINDIR)/cr_capture_driver_e $(CKPT_FILE)
+
+# cr_test.c's do_restore() -- same segment-reservation/codesign/spawn_noaslr
+# shape as thread-restore (same reason: whole-process guard-page collision,
+# still unsolved -- NOTES.md 2026-09-03), signal-based resume mechanism
+# instead of thread-restore's trampoline. Currently expected to fail at
+# sigreturn's PAC check on the resumed pc -- see NOTES.md 2026-09-03.
+cr-restore: cr_restore_driver.c $(BINDIR)/spawn_noaslr
+	$(CC) $(CFLAGS) -arch arm64e -o $(BINDIR)/cr_restore_driver cr_restore_driver.c
+	python3 extend_segment_vmsize.py $(BINDIR)/cr_restore_driver __DATA vmsize=0x50004000
+	python3 extend_segment_vmsize.py $(BINDIR)/cr_restore_driver __LINKEDIT vmaddr=0x15000c000
+	codesign -s - -f $(BINDIR)/cr_restore_driver
+	$(BINDIR)/spawn_noaslr -r $(RETRY_NUMBER) $(BINDIR)/cr_restore_driver $(CKPT_FILE)
+
+cr-run: cr-capture cr-restore
 
 # Does MAP_FIXED (and the malloc-guard-page VM-call battery) behave
 # differently against a shared-cache __DATA page before vs. after it's

@@ -84,8 +84,7 @@ typedef struct {
  * #includes this file, capture and (eventually) restore alike. */
 typedef struct {
     uint32_t region_count;
-    uint64_t capture_used;  /* total bytes across all regions -- informational
-                                now, no shared buffer left to size-check against */
+    uint64_t capture_used;  // total bytes across all regions
     regs_t   regs;
     uint64_t pthread_addr;  /* this thread's own pthread_self(), captured at signal time */
     uint64_t munge;         /* this thread's own live munge (docs/007 algebra: stored_sig XOR
@@ -313,14 +312,6 @@ int do_capture(const char* path) {
      * own new stack frame and a fresh restored_flag=0, so no reset needed. */
     if (restored_flag != 0) {
         printf("resumed from a restore -- not writing a checkpoint again\n");
-        /* NOT free_region_bufs() here (2026-09-03 fix): g_region_bufs[] is
-         * ordinary __DATA, captured like any other global -- by this point
-         * remap_regions() has already overwritten it with the ORIGINAL
-         * capturing process's stale pointer values. Calling munmap() on
-         * those would be operating on garbage addresses from a different
-         * process's address space -- best case a harmless failed syscall,
-         * worst case it coincidentally unmaps something real here. Nothing
-         * was ever allocated in THIS process's g_region_bufs[] to free. */
         return 0;
     }
 
@@ -354,7 +345,6 @@ int do_capture(const char* path) {
     printf("checkpoint written to %s (pthread_addr=0x%llx)\n", path, (uint64_t)g_pthread_addr);
 
     free_region_bufs();
-    pause();
     return 0;
 }
 
@@ -411,19 +401,20 @@ static bool is_cache_region(uint64_t addr) {
  * ordering). */
 static int remap_regions(uint32_t region_count) {
     for (uint32_t i = 0; i < region_count; i++) {
+        
+        if (is_cache_region(g_regions[i].addr)) continue;
+        
         uint64_t addr = g_regions[i].addr;
         uint64_t len = g_regions[i].len;
         int prot = (int)g_regions[i].protection;
         uint64_t offset = g_region_off[i];
-
-        if (is_cache_region(addr)) continue;
 
         void* got = mmap((void*)(uintptr_t)addr, len, PROT_READ | PROT_WRITE,
                          MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
         if (got == MAP_FAILED) {
             int saved_errno = errno;
             fprintf(stderr, "mmap failed for region[%u] [0x%llx,0x%llx): %s\n",
-                    i, (unsigned long long)addr, (unsigned long long)(addr + len), strerror(saved_errno));
+                    i, (uint64_t)addr, (uint64_t)(addr + len), strerror(saved_errno));
             if (saved_errno == ENOMEM) {
                 fprintf(stderr, "  exiting EX_TEMPFAIL for a retry wrapper to try a fresh process\n");
                 exit(EX_TEMPFAIL);
@@ -432,7 +423,7 @@ static int remap_regions(uint32_t region_count) {
         }
         if ((uint64_t)(uintptr_t)got != addr) {
             fprintf(stderr, "mmap did not honor the fixed address for region[%u]: got 0x%llx, expected 0x%llx\n",
-                    i, (unsigned long long)(uintptr_t)got, (unsigned long long)addr);
+                    i, (uint64_t)(uintptr_t)got, (uint64_t)addr);
             return 1;
         }
 
@@ -440,7 +431,7 @@ static int remap_regions(uint32_t region_count) {
 
         if (prot != (PROT_READ | PROT_WRITE) && mprotect(got, len, prot) != 0) {
             fprintf(stderr, "mprotect failed for region[%u] [0x%llx,0x%llx): %s\n",
-                    i, (unsigned long long)addr, (unsigned long long)(addr + len), strerror(errno));
+                    i, (uint64_t)addr, (uint64_t)(addr + len), strerror(errno));
             return 1;
         }
     }
@@ -453,25 +444,26 @@ static int remap_regions(uint32_t region_count) {
  * design. */
 static void remap_cache_regions(uint32_t region_count) {
     for (uint32_t i = 0; i < region_count; i++) {
+        
+        if (!is_cache_region(g_regions[i].addr)) continue;
+        
         uint64_t addr = g_regions[i].addr;
         uint64_t len = g_regions[i].len;
         int prot = (int)g_regions[i].protection;
         uint64_t offset = g_region_off[i];
 
-        if (!is_cache_region(addr)) continue;
-
         void* got = mmap((void*)(uintptr_t)addr, len, PROT_READ | PROT_WRITE,
                          MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
         if (got == MAP_FAILED || (uint64_t)(uintptr_t)got != addr) {
             fprintf(stderr, "  skipped cache region[%u] addr=0x%llx size=0x%llx prot=%d : %s\n",
-                    i, (unsigned long long)addr, (unsigned long long)len, prot,
+                    i, (uint64_t)addr, (uint64_t)len, prot,
                     got == MAP_FAILED ? strerror(errno) : "fixed address not honored");
             continue;
         }
         memcpy(got, g_restore_buf + offset, len);
         if (prot != (PROT_READ | PROT_WRITE) && mprotect(got, len, prot) != 0) {
             fprintf(stderr, "  cache region[%u] addr=0x%llx mapped+copied but mprotect(%d) failed: %s\n",
-                    i, (unsigned long long)addr, prot, strerror(errno));
+                    i, (uint64_t)addr, prot, strerror(errno));
         }
     }
 }
@@ -481,17 +473,17 @@ static void* dummy_entry_fn(void* arg) { (void)arg; for (;;) pause(); return NUL
 /* Mode C's classic technique (full_restore_test.c's restore_state()):
  * overwrite the delivered ucontext_t wholesale, return, let sigreturn
  * apply it. Runs on the worker thread once the queued signal delivers
- * (see file header). Raw write(), not printf -- remap_cache_regions()
- * already ran by the time this fires, same __sF[]._write corruption risk
- * as thread_restore_test.c hit. */
+ * (see file header). Plain printf is safe here (Ivan, 2026-09-04): the
+ * earlier __sF[]._write corruption (thread_restore_test.c) was because
+ * THAT capture was plain arm64 -- an unsigned/no-op field, not just a
+ * wrong-key one. This capture is arm64e, so the transferred field is
+ * validly IA-signed, and IA is process-independent (confirmed 2026-09-01)
+ * -- it authenticates the same in the restore process. */
 static void restore_state(int sig, siginfo_t* info, void* ctx) {
     (void)sig; (void)info;
-    char buf[160];
-    int n = snprintf(buf, sizeof(buf),
-        "restore_state: about to apply pc=%p sp=%p tpidr=0x%llx\n",
-        arm_thread_state64_get_pc_fptr(g_regs.gregs),
-        (void*)arm_thread_state64_get_sp(g_regs.gregs), (uint64_t)g_regs.tpidr);
-    write(2, buf, n > 0 ? (size_t)n : 0);
+    printf("restore_state: about to apply pc=%p sp=%p tpidr=0x%llx\n",
+           arm_thread_state64_get_pc_fptr(g_regs.gregs),
+           (void*)arm_thread_state64_get_sp(g_regs.gregs), (uint64_t)g_regs.tpidr);
 
     ((ucontext_t*)ctx)->uc_mcontext->__ss = g_regs.gregs;
     ((ucontext_t*)ctx)->uc_mcontext->__ns = g_regs.neon;
@@ -531,9 +523,9 @@ int do_restore(const char* path) {
     g_regs = hdr.regs;
 
     printf("read %u regions, %.2f MB, pthread_addr=0x%llx munge=0x%llx sentinel=0x%llx\n",
-           hdr.region_count, hdr.capture_used / 1048576.0,
-           (unsigned long long)hdr.pthread_addr, (unsigned long long)hdr.munge,
-           (unsigned long long)hdr.sentinel);
+           hdr.region_count, hdr.capture_used / (1024.0 * 1024.0),
+           (uint64_t)hdr.pthread_addr, (uint64_t)hdr.munge,
+           (uint64_t)hdr.sentinel);
 
     if (remap_regions(hdr.region_count) != 0) { fprintf(stderr, "failed to remap regions\n"); return 1; }
     printf("non-cache regions remapped at their original addresses\n");
@@ -580,46 +572,39 @@ int do_restore(const char* path) {
     /* Re-sign the SAME struct field to match what the global now actually
      * holds (hdr.munge, no recovery needed -- it's already in the header)
      * instead of patching the global back (thread_restore_test.c's
-     * approach) -- same end state, opposite direction. From here on: raw
-     * write(2), not printf -- same __sF[]._write corruption risk as
-     * thread_restore_test.c hit post-cache-remap. */
+     * approach) -- same end state, opposite direction. Plain printf from
+     * here on is safe -- see restore_state()'s own note on why. */
     uintptr_t sig_v2 = sign_for_addr(worker_addr) ^ (uintptr_t)hdr.munge;
     *(uintptr_t *)worker_addr = sig_v2;
-    char buf[192];
-    int n = snprintf(buf, sizeof(buf),
-        "re-signed worker struct post-cache-remap: munge=0x%llx sig=0x%lx\n",
-        (unsigned long long)hdr.munge, sig_v2);
-    write(2, buf, n > 0 ? (size_t)n : 0);
+    printf("re-signed worker struct post-cache-remap: munge=0x%llx sig=0x%lx\n",
+        (uint64_t)hdr.munge, sig_v2);
 
     pthread_t worker_pt = (pthread_t)(uintptr_t)hdr.pthread_addr;
     mach_port_t worker_port = pthread_mach_thread_np(worker_pt);
-    n = snprintf(buf, sizeof(buf), "pthread_mach_thread_np(worker=0x%llx) => 0x%x\n",
-                 (unsigned long long)hdr.pthread_addr, worker_port);
-    write(2, buf, n > 0 ? (size_t)n : 0);
+    printf("pthread_mach_thread_np(worker=0x%llx) => 0x%x\n",
+                 (uint64_t)hdr.pthread_addr, worker_port);
     if (worker_port == MACH_PORT_NULL) {
-        write(2, "pthread_mach_thread_np failed to resolve the worker's port\n", 61);
+        printf("pthread_mach_thread_np failed to resolve the worker's port\n");
         return 1;
     }
 
     if (hdr.sentinel) {
         *(volatile int *)(uintptr_t)hdr.sentinel = 1;
-        n = snprintf(buf, sizeof(buf), "sentinel at 0x%llx set to 1\n", (unsigned long long)hdr.sentinel);
-        write(2, buf, n > 0 ? (size_t)n : 0);
+        printf("sentinel at 0x%llx set to 1\n", (uint64_t)hdr.sentinel);
     }
 
     /* Queue the signal on the still-suspended thread -- delivery happens
      * the instant thread_resume() runs, before _pthread_start's real
      * dispatch to dummy_entry_fn (Ivan's finding, NOTES.md 2026-09-01/03). */
     int rc = pthread_kill(worker_pt, SIGUSR1);
-    n = snprintf(buf, sizeof(buf), "pthread_kill(worker, SIGUSR1) while suspended => rc=%d\n", rc);
-    write(2, buf, n > 0 ? (size_t)n : 0);
+    printf("pthread_kill(worker, SIGUSR1) while suspended => rc=%d\n", rc);
 
     kern_return_t kr = thread_resume(worker_port);
     if (kr != KERN_SUCCESS) {
-        write(2, "thread_resume failed\n", 22);
+        printf("thread_resume failed\n");
         return 1;
     }
-    write(2, "thread_resume succeeded -- worker should now run the queued signal handler\n", 77);
+    printf("thread_resume succeeded -- worker should now run the queued signal handler\n");
 
     /* Not exit -- the actual resumed execution happens on the worker
      * thread now, not here. Without this, main returns and the whole

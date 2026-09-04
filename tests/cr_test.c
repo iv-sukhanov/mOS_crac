@@ -155,7 +155,11 @@ static bool should_capture(mach_vm_address_t addr, const vm_region_submap_info_d
          * the dyld shared cache's regions don't -- see full_capture_test.c. */
         char buf[MAXPATHLEN];
         int ret = proc_regionfilename(getpid(), addr, buf, sizeof(buf));
-        if (ret <= 0) return false;
+        if (ret <= 0 && (info->protection & VM_PROT_EXECUTE || info->protection == VM_PROT_READ)) {
+            // printf("  skipped external-pager region at 0x%llx-0x%llx prot=%u dirty=%u\n",
+            //        (uint64_t)addr, (uint64_t)addr + size, info->protection, info->pages_dirtied);
+            return false;
+        }
     } else if (in_shared_cache_submap(addr) || in_shared_cache_range(addr)) {
         if (info->protection & VM_PROT_EXECUTE) {
             /* Not expected in practice (this branch is only reached for
@@ -165,6 +169,11 @@ static bool should_capture(mach_vm_address_t addr, const vm_region_submap_info_d
             printf("  note: executable, non-external-pager region in shared-cache "
                    "range at 0x%llx prot=%u -- capturing, not filtered\n",
                    (uint64_t)addr, info->protection);
+        }
+        if (info->protection == VM_PROT_READ) {
+            // printf("  skipped read-only shared-cache region at 0x%llx prot=%u dirty=%u\n",
+            //        (uint64_t)addr, info->protection, info->pages_dirtied);
+            return false;
         }
         return info->protection != VM_PROT_READ; //exclude read-only shared-cache pages 
     }
@@ -329,5 +338,6 @@ int do_capture(const char* path) {
     printf("checkpoint written to %s (pthread_addr=0x%llx)\n", path, (uint64_t)g_pthread_addr);
 
     free_region_bufs();
+    pause();
     return 0;
 }

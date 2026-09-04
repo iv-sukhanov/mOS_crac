@@ -1,0 +1,424 @@
+[
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "barriers_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-c",
+      "barriers_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "bsdthread_create_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-arch",
+      "arm64e",
+      "-c",
+      "bsdthread_create_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "bsdthread_cross_process_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-c",
+      "bsdthread_cross_process_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "cache_data_cow_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-c",
+      "cache_data_cow_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "code_alloc_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-c",
+      "code_alloc_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "cr_capture_driver.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-arch",
+      "arm64e",
+      "-c",
+      "cr_capture_driver.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "cr_restore_driver.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-arch",
+      "arm64e",
+      "-c",
+      "cr_restore_driver.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "cr_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-arch",
+      "arm64e",
+      "-c",
+      "cr_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "full_capture_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-c",
+      "full_capture_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "full_restore_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-c",
+      "full_restore_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "func_location_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-c",
+      "func_location_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "lr_resign_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-arch",
+      "arm64e",
+      "-c",
+      "lr_resign_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "lr_sign_probe.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-arch",
+      "arm64e",
+      "-c",
+      "lr_sign_probe.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "mach_vm_region_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-c",
+      "mach_vm_region_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "mmap_fixed_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-c",
+      "mmap_fixed_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "reserve_hello.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-c",
+      "reserve_hello.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "sim_capture_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-c",
+      "sim_capture_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "sim_checkpoint_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-c",
+      "sim_checkpoint_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "sim_noaslr_restore_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-c",
+      "sim_noaslr_restore_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "spawn_noaslr.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-c",
+      "spawn_noaslr.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "submap_minimal_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-c",
+      "submap_minimal_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "submap_override_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-c",
+      "submap_override_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "thread_capture_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-c",
+      "thread_capture_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "thread_create_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-c",
+      "thread_create_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "thread_restore_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-arch",
+      "arm64e",
+      "-c",
+      "thread_restore_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "thread_suspend_lock_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-c",
+      "thread_suspend_lock_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "thread_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-c",
+      "thread_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "ucontext_reg_sign_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-arch",
+      "arm64e",
+      "-c",
+      "ucontext_reg_sign_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "woa_test.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-c",
+      "woa_test.c",
+      "-o",
+      "/dev/null"
+    ]
+  }
+]

@@ -9,7 +9,7 @@ RETRY_NUMBER ?= 1
 $(BINDIR)/%: %.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello freestanding-spin resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign thread-capture thread-restore thread-run cache-cow-probe reserve-probe full-run-reserved lr-sign-probe cr-capture cr-restore cr-run
+.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello freestanding-spin resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign thread-capture thread-restore thread-run cache-cow-probe reserve-probe full-run-reserved lr-sign-probe cr-capture cr-restore cr-run ucontext-reg-sign
 
 checkpoint: $(BINDIR)/sim_checkpoint_test
 	$(BINDIR)/sim_checkpoint_test checkpoint $(CKPT_FILE)
@@ -203,6 +203,17 @@ reserve-probe: reserve_hello.c extend_segment_vmsize.py $(BINDIR)/spawn_noaslr
 	vmmap -interleaved $$CHILD_PID 2>&1 | grep -E "^__TEXT|^__DATA|^__LINKEDIT|MALLOC guard|MALLOC metadata|MALLOC_TINY|MALLOC_SMALL" | head -20 | tee ../tmps/reserve_hello.vmmap; \
 # 	kill -9 $$CHILD_PID $$SHELL_PID 2>/dev/null; \
 	cat /tmp/reserve_hello.out
+
+# Register-by-register PAC survey of a real kernel-delivered ucontext_t
+# (2026-09-04) -- dumps x0-x28/fp/lr/sp/pc raw vs xpaci/xpacd-stripped plus
+# the __opaque_flags decode, in one self-signal, single run (no cross-run
+# diff needed, unlike lr-sign-probe -- this is a within-process structural
+# question, not a process-dependence one). Needs -arch arm64e for the same
+# reason lr-sign-probe does: the opaque pc/lr/sp/fp fields and the
+# xpaci/xpacd instructions only mean anything real when ptrauth is live.
+ucontext-reg-sign: ucontext_reg_sign_test.c
+	$(CC) $(CFLAGS) -arch arm64e -o $(BINDIR)/ucontext_reg_sign_test ucontext_reg_sign_test.c
+	$(BINDIR)/ucontext_reg_sign_test
 
 clean:
 	rm -f $(CKPT_FILE)

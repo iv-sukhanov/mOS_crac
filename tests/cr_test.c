@@ -125,6 +125,59 @@ static uintptr_t sign_for_addr(uintptr_t addr) {
         ptrauth_string_discriminator("pthread.signature"));
 }
 
+/* docs/010's thread_set_state recipe, proven end-to-end in
+ * thread_state_resign_test.c (2026-09-04): strip a captured pc/lr/sp/fp
+ * with its real key (non-authenticating, safe regardless of whether the
+ * input was even validly signed) then re-sign under THIS process's own
+ * live key. Two functions, not one taking `key` as a parameter --
+ * ptrauth_strip()/ptrauth_sign_unauthenticated()'s key argument must be a
+ * compile-time constant. */
+static uint64_t strip_and_resign_code(uint64_t raw, uint64_t discriminator) {
+    void *stripped = ptrauth_strip((void *)(uintptr_t)raw, ptrauth_key_process_independent_code);
+    void *resigned = ptrauth_sign_unauthenticated(stripped, ptrauth_key_process_independent_code, discriminator);
+    return (uint64_t)(uintptr_t)resigned;
+}
+
+static uint64_t strip_and_resign_data(uint64_t raw, uint64_t discriminator) {
+    void *stripped = ptrauth_strip((void *)(uintptr_t)raw, ptrauth_key_process_independent_data);
+    void *resigned = ptrauth_sign_unauthenticated(stripped, ptrauth_key_process_independent_data, discriminator);
+    return (uint64_t)(uintptr_t)resigned;
+}
+
+/* Re-signs a captured arm_thread_state64_t's pc/lr/sp/fp under THIS
+ * (restoring) process's own live key, in place -- the fix for the
+ * predicted-and-confirmed 2026-09-03 sigreturn PAC rejection: those four
+ * fields arrive signed under the CAPTURING process's key, which
+ * thread_set_state's own convert_from_user (docs/010) will only accept if
+ * it happens to match this process's (open question, still unresolved --
+ * NOTES.md 2026-09-04). Resigning here removes the dependency on that
+ * question entirely, matching a capturing and restoring process either
+ * way. lr specifically branches on IB_SIGNED_LR (thread_state_resign_test.c,
+ * 2026-09-04): a genuinely IB-signed (frame-record style) lr must pass
+ * through untouched, not be IA-stripped/resigned -- xnu itself has no way
+ * to re-derive the original pacibsp's sp-based modifier, so passthrough is
+ * the only correct move for that case, not a shortcut. */
+static void resign_regs_for_this_process(arm_thread_state64_t *s) {
+    uint64_t raw_pc = (uint64_t)(uintptr_t)s->__opaque_pc;
+    uint64_t raw_lr = (uint64_t)(uintptr_t)s->__opaque_lr;
+    uint64_t raw_sp = (uint64_t)(uintptr_t)s->__opaque_sp;
+    uint64_t raw_fp = (uint64_t)(uintptr_t)s->__opaque_fp;
+
+    // TODO: look into __DARWIN_ARM_THREAD_STATE64_FLAGS_NO_PTRAUTH flag later
+    bool ib_signed_lr = !!(s->__opaque_flags & __DARWIN_ARM_THREAD_STATE64_FLAGS_IB_SIGNED_LR);
+    printf("flags set for the state being resigned: 0x%x (IB_SIGNED_LR=%d)\n", s->__opaque_flags, ib_signed_lr);
+
+    uint64_t new_pc = strip_and_resign_code(raw_pc, ptrauth_string_discriminator("pc"));
+    uint64_t new_lr = ib_signed_lr ? raw_lr : strip_and_resign_code(raw_lr, ptrauth_string_discriminator("lr"));
+    uint64_t new_sp = strip_and_resign_data(raw_sp, ptrauth_string_discriminator("sp"));
+    uint64_t new_fp = strip_and_resign_data(raw_fp, ptrauth_string_discriminator("fp"));
+
+    s->__opaque_pc = (void *)(uintptr_t)new_pc;
+    s->__opaque_lr = (void *)(uintptr_t)new_lr;
+    s->__opaque_sp = (void *)(uintptr_t)new_sp;
+    s->__opaque_fp = (void *)(uintptr_t)new_fp;
+}
+
 /* --- region classification: verbatim from full_capture_test.c (2026-08-21) --- */
 
 static bool in_shared_cache_submap(mach_vm_address_t addr) {
@@ -348,45 +401,51 @@ int do_capture(const char* path) {
     return 0;
 }
 
-/* --- do_restore() (2026-09-03) ---
+/* --- do_restore() (2026-09-03, revised 2026-09-04 -- C+D hybrid) ---
  *
  * Same self-signed __bsdthread_create() (docs/007) as thread_restore_test.c
- * for a real, validly-signed thread identity -- but a different resume
- * mechanism (Ivan's call): instead of a hand-rolled asm trampoline seeding
- * PC/SP/TPIDR via thread_set_state() (thread_restore_test.c's
- * tls_seed_trampoline), signal the thread WHILE STILL SUSPENDED, then
- * thread_resume() it -- the queued signal delivers the instant it resumes
- * (NOTES.md 2026-09-01/03), before the kernel-initialized _pthread_start
- * path ever runs dummy_entry_fn for real. The handler just overwrites the
- * delivered ucontext_t wholesale (mode C's classic technique,
- * full_restore_test.c's restore_state()) and returns -- sigreturn applies
- * it. Simpler than the trampoline: no opaque-PC-signing dance needed
- * (capture and restore are both arm64e now, same struct layout on both
- * sides, a whole-struct copy is well-typed), and no separate TPIDR seed
- * step (the handler can just execute `msr` directly, unlike
- * thread_set_state which has no TPIDR_EL0 flavor at all).
+ * for a real, validly-signed thread identity, and the same "queue the
+ * signal while still suspended, then thread_resume()" mechanism (NOTES.md
+ * 2026-09-01/03) to get code running before _pthread_start's kernel-
+ * initialized path ever dispatches to dummy_entry_fn for real -- but the
+ * ORIGINAL version of this function (2026-09-03, mode C's classic
+ * technique, full_restore_test.c's restore_state()) had the handler
+ * overwrite the delivered ucontext_t wholesale with the CAPTURED gregs/neon
+ * and let sigreturn apply it -- which failed exactly as that entry
+ * predicted: sigreturn rejects a pc signed under a foreign (capturing)
+ * process's key.
  *
- * Ordering (Ivan's call, 2026-09-03): remap non-cache regions -> sign the
- * worker struct with THIS process's own live munge (recovered from main's
- * own already-valid struct, same algebra as thread_restore_test.c) ->
- * __bsdthread_create() (succeeds: the munge global is still this
- * process's own, untouched) -> remap_cache_regions() (clobbers the munge
- * global with hdr.munge, the CAPTURED process's own value) -> re-sign the
- * SAME struct a second time, this time with hdr.munge directly (no
- * recovery needed, it's already in the header) so the struct's signature
- * stays consistent with whatever the global now actually holds. Two signs
- * of one field, not a global patch -- avoids needing
- * thread_restore_test.c's PTHREAD_LIST_LOCK_CACHE_OFFSET-style direct
- * addressing of the munge global entirely.
+ * Fixed by combining mode C and mode D instead of choosing one (Ivan's
+ * design, 2026-09-04), using this session's docs/010 thread_set_state
+ * research: general+NEON registers (pc/lr/sp/fp resigned under THIS
+ * process's own key first, resign_regs_for_this_process()) are seeded via
+ * thread_set_state() on the worker thread WHILE IT'S STILL SUSPENDED,
+ * mode D's own precise mechanism -- before the signal is even queued.
+ * Since the queued signal still delivers before a single userspace
+ * instruction of _pthread_start executes, nothing touches that seeded
+ * state before the handler's ucontext is built from it -- and, this is the
+ * actual fix, the kernel's own delivery-side machine_thread_state_convert_to_user
+ * (docs/010) freshly IA-signs pc/lr under THIS process's own key at that
+ * exact moment, so sigreturn's later re-validation is checking a signature
+ * the same kernel/process boundary just generated, not a foreign one. The
+ * handler (restore_state()) keeps mode C's real advantage -- a hook to run
+ * actual code before the checkpointed routine resumes -- but its job
+ * shrinks to the one piece of state thread_set_state can't seed at all:
+ * TPIDR_EL0, set directly with `msr`, then return normally.
  *
- * Expected to fail at this stage, on purpose (Ivan's framing): captured
- * pc (and any stack-resident LR) are genuinely PAC-signed under the
- * CAPTURING process's own key (cr_test.c is arm64e now, unlike
- * thread_capture_test.c) -- this whole session's LR-signing research
- * (lr_sign_probe.c, lr_resign_test.c) exists to eventually fix this, not
- * done here. Goal for this pass: confirm everything up to and including
- * the resume mechanism itself works, and observe the predicted signature
- * failure directly rather than assume it. */
+ * Ordering (Ivan's call, 2026-09-03, unchanged by the above): remap
+ * non-cache regions -> sign the worker struct with THIS process's own live
+ * munge (recovered from main's own already-valid struct, same algebra as
+ * thread_restore_test.c) -> __bsdthread_create() (succeeds: the munge
+ * global is still this process's own, untouched) -> remap_cache_regions()
+ * (clobbers the munge global with hdr.munge, the CAPTURED process's own
+ * value) -> re-sign the SAME struct a second time, this time with
+ * hdr.munge directly (no recovery needed, it's already in the header) so
+ * the struct's signature stays consistent with whatever the global now
+ * actually holds. Two signs of one field, not a global patch -- avoids
+ * needing thread_restore_test.c's PTHREAD_LIST_LOCK_CACHE_OFFSET-style
+ * direct addressing of the munge global entirely. thread_set_state() slots
+ * in after worker_port is resolved, still before the signal is queued. */
 
 static uint8_t* g_restore_buf;
 static uint64_t g_region_off[MAX_REGIONS];
@@ -470,23 +529,28 @@ static void remap_cache_regions(uint32_t region_count) {
 
 static void* dummy_entry_fn(void* arg) { (void)arg; for (;;) pause(); return NULL; }
 
-/* Mode C's classic technique (full_restore_test.c's restore_state()):
- * overwrite the delivered ucontext_t wholesale, return, let sigreturn
- * apply it. Runs on the worker thread once the queued signal delivers
- * (see file header). Plain printf is safe here (Ivan, 2026-09-04): the
- * earlier __sF[]._write corruption (thread_restore_test.c) was because
- * THAT capture was plain arm64 -- an unsigned/no-op field, not just a
- * wrong-key one. This capture is arm64e, so the transferred field is
- * validly IA-signed, and IA is process-independent (confirmed 2026-09-01)
- * -- it authenticates the same in the restore process. */
+/* C+D hybrid (Ivan's design, 2026-09-04): the general+NEON registers are
+ * no longer set here at all -- by the time this handler runs, do_restore()
+ * has already called thread_set_state() on this same (still-suspended at
+ * the time) thread with the checkpoint's pc/lr/sp/fp resigned under THIS
+ * process's own key (resign_regs_for_this_process()). Since the queued
+ * signal delivers before _pthread_start ever executes a single userspace
+ * instruction (NOTES.md 2026-09-01/03), nothing has touched that state in
+ * between -- the ucontext_t this handler receives already reflects
+ * exactly what thread_set_state applied, and (this is the actual fix)
+ * freshly IA-signed under THIS process's own key by the kernel's own
+ * delivery-side machine_thread_state_convert_to_user (docs/010) -- not the
+ * capturing process's foreign signature mode C's old wholesale-ucontext-
+ * overwrite handed sigreturn directly, which is exactly what sigreturn
+ * rejected on 2026-09-03. This handler's only remaining job is the one
+ * piece of state thread_set_state can't seed: TPIDR_EL0 (no such flavor
+ * exists -- do_restore()'s own header comment already established this).
+ * Returning normally lets sigreturn re-validate a signature the kernel
+ * itself just generated for this exact context, moments earlier. */
 static void restore_state(int sig, siginfo_t* info, void* ctx) {
-    (void)sig; (void)info;
-    printf("restore_state: about to apply pc=%p sp=%p tpidr=0x%llx\n",
-           arm_thread_state64_get_pc_fptr(g_regs.gregs),
-           (void*)arm_thread_state64_get_sp(g_regs.gregs), (uint64_t)g_regs.tpidr);
-
-    ((ucontext_t*)ctx)->uc_mcontext->__ss = g_regs.gregs;
-    ((ucontext_t*)ctx)->uc_mcontext->__ns = g_regs.neon;
+    (void)sig; (void)info; (void)ctx;
+    printf("restore_state: setting tpidr=0x%llx, letting sigreturn apply the "
+           "already-thread_set_state()'d GPR/NEON/pc/lr/sp/fp\n", (uint64_t)g_regs.tpidr);
     __asm__ volatile ("msr tpidr_el0, %0" :: "r" (g_regs.tpidr));
 }
 
@@ -592,6 +656,44 @@ int do_restore(const char* path) {
         *(volatile int *)(uintptr_t)hdr.sentinel = 1;
         printf("sentinel at 0x%llx set to 1\n", (uint64_t)hdr.sentinel);
     }
+
+    /* Mode D's half of the hybrid: seed the full GPR+NEON state directly
+     * via thread_set_state() while the worker is still suspended -- pc/lr/
+     * sp/fp resigned under THIS process's own key first (see
+     * resign_regs_for_this_process()'s comment for why this, not the
+     * captured bytes, is what actually gets sent). Safe to do before the
+     * signal is even queued: the thread hasn't run a single userspace
+     * instruction yet, so there's no ordering hazard with pthread_kill()/
+     * thread_resume() below either way. */
+    arm_thread_state64_t seeded_gregs = g_regs.gregs;
+    resign_regs_for_this_process(&seeded_gregs);
+
+    /* DIAGNOSTIC (temporary): raw casts only, no authenticating accessors --
+     * isolating whether a printf's own ptrauth_auth_function() call is what
+     * crashes, vs. thread_set_state() itself. */
+    printf("DIAG: about to thread_set_state(GPR): raw pc=0x%016llx sp=0x%016llx lr=0x%016llx fp=0x%016llx flags=0x%08x worker_port=0x%x\n",
+           (uint64_t)(uintptr_t)seeded_gregs.__opaque_pc, (uint64_t)(uintptr_t)seeded_gregs.__opaque_sp,
+           (uint64_t)(uintptr_t)seeded_gregs.__opaque_lr, (uint64_t)(uintptr_t)seeded_gregs.__opaque_fp,
+           seeded_gregs.__opaque_flags, worker_port);
+    fflush(stdout);
+    kern_return_t kr_gpr = thread_set_state(worker_port, ARM_THREAD_STATE64,
+                                             (thread_state_t)&seeded_gregs, ARM_THREAD_STATE64_COUNT);
+    printf("DIAG: thread_set_state(GPR) returned kr=%d\n", kr_gpr);
+    fflush(stdout);
+    if (kr_gpr != KERN_SUCCESS) {
+        fprintf(stderr, "thread_set_state(GPR) failed: %d\n", kr_gpr);
+        return 1;
+    }
+    kern_return_t kr_neon = thread_set_state(worker_port, ARM_NEON_STATE64,
+                                              (thread_state_t)&g_regs.neon, ARM_NEON_STATE64_COUNT);
+    printf("DIAG: thread_set_state(NEON) returned kr=%d\n", kr_neon);
+    fflush(stdout);
+    if (kr_neon != KERN_SUCCESS) {
+        fprintf(stderr, "thread_set_state(NEON) failed: %d (non-fatal, continuing)\n", kr_neon);
+    }
+    printf("thread_set_state(GPR+NEON) applied to suspended worker: raw pc=0x%016llx sp=0x%016llx\n",
+           (uint64_t)(uintptr_t)seeded_gregs.__opaque_pc, (uint64_t)(uintptr_t)seeded_gregs.__opaque_sp);
+    fflush(stdout);
 
     /* Queue the signal on the still-suspended thread -- delivery happens
      * the instant thread_resume() runs, before _pthread_start's real

@@ -645,12 +645,26 @@ int do_restore(const char* path) {
 
     pthread_t worker_pt = (pthread_t)(uintptr_t)hdr.pthread_addr;
     mach_port_t worker_port = pthread_mach_thread_np(worker_pt);
-    printf("pthread_mach_thread_np(worker=0x%llx) => 0x%x\n",
-                 (uint64_t)hdr.pthread_addr, worker_port);
+
+    mach_port_t main_port = mach_thread_self();
+    thread_act_array_t acts;
+    mach_msg_type_number_t n_acts;
+    if (task_threads(mach_task_self(), &acts, &n_acts) != KERN_SUCCESS) {
+        fprintf(stderr, "task_threads failed\n"); return 1;
+    }
+    mach_port_t worker_port_alt = MACH_PORT_NULL;
+    for (mach_msg_type_number_t i = 0; i < n_acts; i++) {
+        if (acts[i] != main_port) { worker_port_alt = acts[i]; break; }
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)acts, sizeof(thread_act_t) * n_acts);
     if (worker_port == MACH_PORT_NULL) {
-        printf("pthread_mach_thread_np failed to resolve the worker's port\n");
+        fprintf(stderr, "couldn't find the new thread's port via task_threads()\n");
         return 1;
     }
+
+    printf("pthread_mach_thread_np(worker=0x%llx) => 0x%x, alt=0x%x (%s)\n",
+                 (uint64_t)hdr.pthread_addr, worker_port, worker_port_alt, worker_port_alt == worker_port ? "MATCH" : "MISMATCH");
+    if (worker_port != worker_port_alt) worker_port = worker_port_alt;
 
     if (hdr.sentinel) {
         *(volatile int *)(uintptr_t)hdr.sentinel = 1;

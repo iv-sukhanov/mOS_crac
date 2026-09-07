@@ -365,6 +365,9 @@ int do_capture(const char* path) {
      * own new stack frame and a fresh restored_flag=0, so no reset needed. */
     if (restored_flag != 0) {
         printf("resumed from a restore -- not writing a checkpoint again\n");
+        for (int i = 0; i < 5; i++) {
+            printf("in loop: %d\n", restored_flag++);
+        }
         return 0;
     }
 
@@ -529,6 +532,45 @@ static void remap_cache_regions(uint32_t region_count) {
 
 static void* dummy_entry_fn(void* arg) { (void)arg; for (;;) pause(); return NULL; }
 
+/* Walk the restored FP chain and re-sign every frame-record return address
+ * under THIS process's own key -- the fix for the 2026-09-07 crash
+ * (NOTES.md). remap_regions() put the captured stack back at its original
+ * addresses, but every {saved fp, saved lr} record on it holds a return
+ * address the CAPTURING process signed (IB / modifier = frame entry sp --
+ * process-dependent key, `ptrauth_key_return_address`). resign_regs_for_this_process()
+ * only fixes the four REGISTER values pc/lr/sp/fp; the first authenticated
+ * return that reloads x30 from one of these stack records (pthread_kill's
+ * epilogue returning into raise, in the observed crash) still hits a
+ * foreign signature, `retab` mangles it, the following `ret` faults.
+ *
+ * Mechanism verbatim from lr_resign_test.c (2026-09-01), which locked it
+ * against a real multi-frame live stack: xpaci to strip (no auth, key-
+ * agnostic), pacib with modifier = fp+0x10 (the frame's true entry sp) to
+ * resign. Stop when a record has fp==0 AND lr strips to 0 together
+ * (_dyld_start's sentinel frame -- lr_resign_test.c verified this via lldb).
+ * Monotonic-fp safety net against a corrupted/foreign chain. Runs from
+ * restore_state(), a signal handler: raw loads/stores + xpaci/pacib only,
+ * no libc -- async-signal-safe. Returns the number of records rewritten. */
+static int walk_and_resign_stack(uint64_t fp) {
+    int n = 0;
+    if (fp == 0) return 0;
+    for (;; n++) {
+        uint64_t next_fp = *(uint64_t *)(uintptr_t)fp;
+        uint64_t lr      = *(uint64_t *)(uintptr_t)(fp + 0x8);
+
+        __asm__ volatile("xpaci %0" : "+r"(lr));
+        if (lr == 0 && next_fp == 0) break;          /* _dyld_start sentinel frame */
+
+        uint64_t modifier = fp + 0x10;
+        __asm__ volatile("pacib %0, %1" : "+r"(lr) : "r"(modifier));
+        *(uint64_t *)(uintptr_t)(fp + 0x8) = lr;
+
+        if (next_fp <= fp) break;                    /* chain not strictly outward -- bail */
+        fp = next_fp;
+    }
+    return n;
+}
+
 /* C+D hybrid (Ivan's design, 2026-09-04): the general+NEON registers are
  * no longer set here at all -- by the time this handler runs, do_restore()
  * has already called thread_set_state() on this same (still-suspended at
@@ -549,9 +591,20 @@ static void* dummy_entry_fn(void* arg) { (void)arg; for (;;) pause(); return NUL
  * itself just generated for this exact context, moments earlier. */
 static void restore_state(int sig, siginfo_t* info, void* ctx) {
     (void)sig; (void)info; (void)ctx;
-    printf("restore_state: setting tpidr=0x%llx, letting sigreturn apply the "
-           "already-thread_set_state()'d GPR/NEON/pc/lr/sp/fp\n", (uint64_t)g_regs.tpidr);
     __asm__ volatile ("msr tpidr_el0, %0" :: "r" (g_regs.tpidr));
+
+    /* Strip the captured fp (delivered signal contexts carry it DA-signed --
+     * NOTES.md 2026-09-04 -- and DA is process-independent, so this strip is
+     * valid regardless of which process signed it) to a raw stack address,
+     * then resign every frame-record LR above it under this process's key.
+     * The register lr/sp/fp/pc are handled separately by
+     * resign_regs_for_this_process(); this covers the on-stack records the
+     * resumed code will actually `retab` through. */
+    uint64_t fp = (uint64_t)(uintptr_t)ptrauth_strip(
+        (void *)(uintptr_t)g_regs.gregs.__opaque_fp, ptrauth_key_process_independent_data);
+    int n = walk_and_resign_stack(fp);
+    printf("restore_state: tpidr=0x%llx set; resigned %d frame-record LR(s) on "
+           "the restored stack from fp=0x%llx\n", (uint64_t)g_regs.tpidr, n, fp);
 }
 
 int do_restore(const char* path) {

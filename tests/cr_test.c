@@ -216,7 +216,7 @@ static bool should_capture(mach_vm_address_t addr, const vm_region_submap_info_d
          * the dyld shared cache's regions don't -- see full_capture_test.c. */
         char buf[MAXPATHLEN];
         int ret = proc_regionfilename(getpid(), addr, buf, sizeof(buf));
-        if (ret <= 0 && (info->protection & VM_PROT_EXECUTE || info->protection == VM_PROT_READ)) {
+        if (ret <= 0 && (info->protection & VM_PROT_EXECUTE || info->max_protection == VM_PROT_READ)) {
             // printf("  skipped external-pager region at 0x%llx-0x%llx prot=%u dirty=%u\n",
             //        (uint64_t)addr, (uint64_t)addr + size, info->protection, info->pages_dirtied);
             return false;
@@ -231,7 +231,7 @@ static bool should_capture(mach_vm_address_t addr, const vm_region_submap_info_d
                    "range at 0x%llx prot=%u -- capturing, not filtered\n",
                    (uint64_t)addr, info->protection);
         }
-        if (info->protection == VM_PROT_READ) {
+        if (info->max_protection == VM_PROT_READ) {
             // printf("  skipped read-only shared-cache region at 0x%llx prot=%u dirty=%u\n",
             //        (uint64_t)addr, info->protection, info->pages_dirtied);
             return false;

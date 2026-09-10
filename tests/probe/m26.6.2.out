@@ -1,0 +1,54 @@
+=== 26.6.2 (25G83) arm64 ===
+SIP: System Integrity Protection status: enabled.
+hw.optional.arm.FEAT_FPAC: 1
+hw.optional.arm.FEAT_FPACCOMBINE: 0
+machdep.ptrauth_enabled: 1
+
+########## arm64e ##########
+----- run 1 -----
+main            = 0xff450001000004b0
+anchor          = 0x23758001000006c8
+&stackvar       = 0x000000016fdff25c
+cache_base      = 0x000000018c44c000
+printf raw      = 0x110400018c805964
+printf bare VA  = 0x000000018c805964
+PACIZA(printf)  = 0x110400018c805964
+PACIA(printf,0) = 0x110400018c805964
+PACDZA(printf)  = 0x006d80018c805964
+&printf (C fp)  = 0x110400018c805964
+----- run 2 -----
+main            = 0x51408001000004b0
+anchor          = 0x4b030001000006c8
+&stackvar       = 0x000000016fdff25c
+cache_base      = 0x000000018c44c000
+printf raw      = 0x485280018c805964
+printf bare VA  = 0x000000018c805964
+PACIZA(printf)  = 0x485280018c805964
+PACIA(printf,0) = 0x485280018c805964
+PACDZA(printf)  = 0x005600018c805964
+&printf (C fp)  = 0x485280018c805964
+----- run 3 -----
+main            = 0x95478001000004b0
+anchor          = 0x293c0001000006c8
+&stackvar       = 0x000000016fdff25c
+cache_base      = 0x000000018c44c000
+printf raw      = 0x415b80018c805964
+printf bare VA  = 0x000000018c805964
+PACIZA(printf)  = 0x415b80018c805964
+PACIA(printf,0) = 0x415b80018c805964
+PACDZA(printf)  = 0x006900018c805964
+&printf (C fp)  = 0x415b80018c805964
+
+########## plain arm64 (control: PAC should be a no-op) ##########
+----- run 1 -----
+cache_base      = 0x000000018c44c000
+PACIZA(printf)  = 0x000000018c805964
+PACDZA(printf)  = 0x000000018c805964
+----- run 2 -----
+cache_base      = 0x000000018c44c000
+PACIZA(printf)  = 0x000000018c805964
+PACDZA(printf)  = 0x000000018c805964
+----- run 3 -----
+cache_base      = 0x000000018c44c000
+PACIZA(printf)  = 0x000000018c805964
+PACDZA(printf)  = 0x000000018c805964

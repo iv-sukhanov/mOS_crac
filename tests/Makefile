@@ -138,7 +138,16 @@ thread-run: thread-capture thread-restore
 # needs -arch arm64e itself now (unlike thread_capture_test.c), so this
 # gets an _e suffix like the arm64e capture builds used ad hoc this
 # session, distinguishing it from any future plain-arm64 cr_* build.
-cr-capture: cr_capture_driver.c
+
+# crac_daemon.c -- idle "T-" PAC-key anchor (NOTES.md 2026-09-10). Must be
+# arm64e (only an arm64e, non-platform, ad-hoc-signed binary lands in the
+# kernel's "T-" bucket at all) and must sit next to cr_capture_driver_e /
+# cr_restore_driver -- do_capture()'s find_or_launch_daemon() resolves it
+# relative to its own running path, not a hardcoded location.
+$(BINDIR)/crac_daemon: crac_daemon.c
+	$(CC) $(CFLAGS) -arch arm64e -o $(BINDIR)/crac_daemon crac_daemon.c
+
+cr-capture: cr_capture_driver.c $(BINDIR)/crac_daemon
 	$(CC) $(CFLAGS) -arch arm64e -o $(BINDIR)/cr_capture_driver_e cr_capture_driver.c
 	$(BINDIR)/cr_capture_driver_e $(CKPT_FILE)
 

@@ -11,6 +11,10 @@
  * plain address.
  *
  * CAPTURE (do_capture)
+ *   0. find_or_launch_daemon(): look up crac_daemon by comm name in the
+ *      process list, launching it if it isn't running (NOTES.md 2026-09-10).
+ *      Its pid goes into the header purely as a diagnostic -- see
+ *      checkpoint_header_t.daemon_pid.
  *   1. classify_regions(): walk our own address space, keep every private
  *      region that is writable or was once writable (should_capture()),
  *      skipping the dyld shared cache's immutable pages.
@@ -92,8 +96,12 @@
 #include <libproc.h>
 #include <sys/param.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <sysexits.h>
 #include <mach/mach.h>
+#include <spawn.h>
+
+extern char **environ;
 
 #if !__has_feature(ptrauth_calls)
 #error "build with -arch arm64e -- see file header for why this is required"
@@ -101,6 +109,14 @@
 
 #define MAX_REGIONS 256
 #define STACK_SIZE  (256 * 1024)
+
+/* crac_daemon.c -- idle "T-" PAC-key anchor, see its file header and
+ * NOTES.md 2026-09-10. Assumed to sit right next to this binary (built
+ * there by the Makefile). find_or_launch_daemon() looks it up by comm name
+ * before falling back to launching it, so repeated captures/restores in the
+ * same boot reuse one daemon instead of piling up idle processes. */
+#define CRAC_DAEMON_NAME    "crac_daemon"
+#define CRAC_DAEMON_PIDFILE "/tmp/crac_daemon.pid"
 
 #define PTHREAD_START_CUSTOM    0x01000000u
 #define PTHREAD_START_SUSPENDED 0x20000000u
@@ -133,6 +149,15 @@ typedef struct {
                                PC back into do_capture() after raise(); restore pokes
                                a 1 here first (the stack region restores the captured
                                0), and do_capture() then skips re-writing a checkpoint. */
+    int32_t  daemon_pid;    /* crac_daemon pid alive at capture time (-1 if none could
+                               be found/launched). Purely diagnostic here -- do_restore()
+                               logs whether it's still alive but proceeds either way.
+                               See NOTES.md 2026-09-10: as long as a "T-" process was
+                               alive continuously from this capture to a restore, both
+                               see the same PAC A/DA key and every captured IA/DA-signed
+                               pointer stays valid; if daemon_pid is dead by restore time
+                               that guarantee is gone, but nothing here enforces it yet. */
+    char     daemon_name[32]; /* CRAC_DAEMON_NAME, nul-padded -- just for logging. */
 } checkpoint_header_t;
 
 static region_desc_t g_regions[MAX_REGIONS];
@@ -318,6 +343,95 @@ static void capture_state(int sig, siginfo_t* info, void* ctx) {
     }
 }
 
+/* --- crac_daemon lookup/launch (see its file header and NOTES.md 2026-09-10) --- */
+
+/* crac_daemon is built into the same directory as this binary. Resolve that
+ * directory from our own running path rather than assuming a cwd. */
+static int daemon_binary_path(char* out, size_t outsz) {
+    char self[PROC_PIDPATHINFO_MAXSIZE];
+    if (proc_pidpath(getpid(), self, sizeof(self)) <= 0) return -1;
+    char* slash = strrchr(self, '/');
+    if (!slash) return -1;
+    *slash = '\0';
+    snprintf(out, outsz, "%s/%s", self, CRAC_DAEMON_NAME);
+    return 0;
+}
+
+/* Scan the process list for a live crac_daemon, matching by comm name (what
+ * `ps`/proc_name() report, i.e. the name the kernel recorded at exec time --
+ * not a path). Unprivileged: any user can list any user's PIDs/names on
+ * macOS, no special access needed (NOTES.md 2026-09-11). */
+static pid_t find_running_daemon(void) {
+    pid_t pids[4096];
+    int bytes = proc_listpids(PROC_ALL_PIDS, 0, pids, sizeof(pids));
+    if (bytes <= 0) return -1;
+    int n = bytes / (int)sizeof(pid_t);
+    for (int i = 0; i < n; i++) {
+        if (pids[i] <= 0) continue;
+        char name[64] = {0};
+        if (proc_name(pids[i], name, sizeof(name)) <= 0) continue;
+        if (strcmp(name, CRAC_DAEMON_NAME) == 0) return pids[i];
+    }
+    return -1;
+}
+
+/* posix_spawn crac_daemon, reap the immediate child (it fork()s+setsid()s
+ * itself away and returns/exits almost at once -- see crac_daemon.c), then
+ * poll briefly for the detached daemon to publish its real, final pid via
+ * CRAC_DAEMON_PIDFILE (we can't get that pid from posix_spawn itself: it
+ * hands back the pid of the process we spawned, not the grandchild it
+ * daemonizes into). */
+static pid_t launch_daemon(void) {
+    char path[MAXPATHLEN];
+    if (daemon_binary_path(path, sizeof(path)) != 0) {
+        fprintf(stderr, "launch_daemon: couldn't resolve own executable path\n");
+        return -1;
+    }
+    unlink(CRAC_DAEMON_PIDFILE); /* drop a stale pidfile from a previous, now-dead daemon */
+
+    pid_t spawned;
+    char* argv[] = { path, NULL };
+    int rc = posix_spawn(&spawned, path, NULL, NULL, argv, environ);
+    if (rc != 0) {
+        fprintf(stderr, "launch_daemon: posix_spawn(%s) failed: %s\n", path, strerror(rc));
+        return -1;
+    }
+    int status;
+    waitpid(spawned, &status, 0); /* reap the outer process; it exits fast (see above) */
+
+    for (int i = 0; i < 50; i++) { /* ~500ms total */
+        FILE* pf = fopen(CRAC_DAEMON_PIDFILE, "r");
+        if (pf) {
+            long pid = 0;
+            int got = fscanf(pf, "%ld", &pid);
+            fclose(pf);
+            if (got == 1 && pid > 0) return (pid_t)pid;
+        }
+        usleep(10 * 1000);
+    }
+    fprintf(stderr, "launch_daemon: timed out waiting for %s to write %s\n",
+            CRAC_DAEMON_NAME, CRAC_DAEMON_PIDFILE);
+    return -1;
+}
+
+/* Find crac_daemon if it's already running (so repeated captures in the same
+ * boot share one anchor instead of piling up idle processes); launch it
+ * otherwise. Never fatal to the caller -- returns -1 on failure, and capture
+ * proceeds regardless (see checkpoint_header_t.daemon_pid). */
+static pid_t find_or_launch_daemon(void) {
+    pid_t pid = find_running_daemon();
+    if (pid > 0) {
+        printf("crac_daemon already running (pid=%d)\n", pid);
+        return pid;
+    }
+    pid = launch_daemon();
+    if (pid > 0) printf("launched crac_daemon (pid=%d)\n", pid);
+    else fprintf(stderr, "find_or_launch_daemon: no crac_daemon available -- "
+                          "capture will proceed, but this checkpoint's PAC keys "
+                          "may not survive to restore time (NOTES.md 2026-09-10)\n");
+    return pid;
+}
+
 /* classify -> per-region buffers -> self-signal -> write file. */
 int do_capture(const char* path) {
     /* volatile: force a real load on each check below. A restored thread's
@@ -326,6 +440,8 @@ int do_capture(const char* path) {
      * restore pokes into *sentinel. */
     volatile int restored_flag = 0;
     uint64_t sentinel = (uint64_t)(uintptr_t)&restored_flag;
+
+    pid_t daemon_pid = find_or_launch_daemon();
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -357,11 +473,12 @@ int do_capture(const char* path) {
     }
 
     /* pc/sp are opaque on arm64e -- use the accessor macros, not raw fields. */
-    printf("captured %u regions, %.2f MB, pc=%p sp=%p tpidr=0x%llx pthread_addr=0x%llx munge=0x%llx\n",
+    printf("captured %u regions, %.2f MB, pc=%p sp=%p tpidr=0x%llx pthread_addr=0x%llx munge=0x%llx daemon_pid=%d\n",
            g_region_count, total / (1024.0 * 1024.0),
            arm_thread_state64_get_pc_fptr(g_regs.gregs),
            (void*)arm_thread_state64_get_sp(g_regs.gregs),
-           (uint64_t)g_regs.tpidr, (uint64_t)g_pthread_addr, (uint64_t)g_munge);
+           (uint64_t)g_regs.tpidr, (uint64_t)g_pthread_addr, (uint64_t)g_munge,
+           (int)daemon_pid);
 
     FILE* f = fopen(path, "wb");
     if (!f) { perror("fopen"); free_region_bufs(); return 1; }
@@ -372,7 +489,9 @@ int do_capture(const char* path) {
         .pthread_addr = g_pthread_addr,
         .munge = g_munge,
         .sentinel = sentinel,
+        .daemon_pid = (int32_t)daemon_pid, /* -1 if find_or_launch_daemon() couldn't get one */
     };
+    strlcpy(hdr.daemon_name, CRAC_DAEMON_NAME, sizeof(hdr.daemon_name));
     fwrite(&hdr, sizeof(hdr), 1, f);
     fwrite(g_regions, sizeof(region_desc_t), g_region_count, f);
     for (uint32_t i = 0; i < g_region_count; i++) {
@@ -521,10 +640,30 @@ int do_restore(const char* path) {
     fclose(f);
     g_regs = hdr.regs;
 
-    printf("read %u regions, %.2f MB, pthread_addr=0x%llx munge=0x%llx sentinel=0x%llx\n",
+    printf("read %u regions, %.2f MB, pthread_addr=0x%llx munge=0x%llx sentinel=0x%llx daemon_pid=%d\n",
            hdr.region_count, hdr.capture_used / (1024.0 * 1024.0),
            (uint64_t)hdr.pthread_addr, (uint64_t)hdr.munge,
-           (uint64_t)hdr.sentinel);
+           (uint64_t)hdr.sentinel, hdr.daemon_pid);
+
+    /* Diagnostic only -- see checkpoint_header_t.daemon_pid. kill(pid, 0) is a
+     * no-op probe: it validates the pid exists (and our permission to signal
+     * it) without actually sending anything. Never fatal: an engine that
+     * refuses to restore just because its anchor died would be worse than
+     * one that restores and might crash -- the crash itself (if any) will
+     * say plenty on its own. */
+    if (hdr.daemon_pid <= 0) {
+        printf("no %s was recorded at capture time -- this checkpoint's PAC keys "
+               "may not match this process's; restore may crash\n",
+               hdr.daemon_name[0] ? hdr.daemon_name : CRAC_DAEMON_NAME);
+    } else if (kill((pid_t)hdr.daemon_pid, 0) == 0) {
+        printf("%s (pid=%d) recorded at capture time is still alive -- PAC keys "
+               "should match\n", hdr.daemon_name, hdr.daemon_pid);
+    } else {
+        printf("%s (pid=%d) recorded at capture time is NOT running anymore (%s) -- "
+               "this checkpoint's PAC keys may have been regenerated since capture; "
+               "restore may crash\n",
+               hdr.daemon_name, hdr.daemon_pid, strerror(errno));
+    }
 
     if (remap_regions(hdr.region_count, false) != 0) { fprintf(stderr, "failed to remap regions\n"); return 1; }
     printf("non-cache regions remapped at their original addresses\n");

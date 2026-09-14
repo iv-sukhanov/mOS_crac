@@ -177,7 +177,7 @@ cr-run: cr-capture cr-restore
 # NOTES.md 2026-09-14 traced it to a page-alignment bug -- RESERVED_SPACE
 # was 0x1000 while this host's real page size is 0x4000 -- now fixed.)
 region-reserver-probe: region_reserver_test.c $(BINDIR)/spawn_noaslr
-	$(CC) $(CFLAGS) -o $(BINDIR)/fun region_reserver_test.c
+	$(CC) $(CFLAGS) -o $(BINDIR)/region_reserver_test region_reserver_test.c
 	$(CC) $(CFLAGS) -arch arm64e -Wl,-headerpad,0x1000 -o $(BINDIR)/func_sig_test func_sig_test.c
 	cd $(BINDIR) && ./region_reserver_test func_sig_test
 	chmod +x $(BINDIR)/modified_macho

@@ -177,17 +177,17 @@ cr-run: cr-capture cr-restore
 # NOTES.md 2026-09-14 traced it to a page-alignment bug -- RESERVED_SPACE
 # was 0x1000 while this host's real page size is 0x4000 -- now fixed.)
 region-reserver-probe: region_reserver_test.c $(BINDIR)/spawn_noaslr
-	$(CC) $(CFLAGS) -o $(BINDIR)/region_reserver_test region_reserver_test.c
-	$(CC) $(CFLAGS) -arch arm64e -Wl,-headerpad,0x1000 -o $(BINDIR)/cr_restore_driver_hp cr_restore_driver.c
-	cd $(BINDIR) && ./region_reserver_test cr_restore_driver_hp
+	$(CC) $(CFLAGS) -o $(BINDIR)/fun region_reserver_test.c
+	$(CC) $(CFLAGS) -arch arm64e -Wl,-headerpad,0x1000 -o $(BINDIR)/func_sig_test func_sig_test.c
+	cd $(BINDIR) && ./region_reserver_test func_sig_test
 	chmod +x $(BINDIR)/modified_macho
 	codesign -s - -f $(BINDIR)/modified_macho
 	@echo "--- new segment ---"
 	otool -l $(BINDIR)/modified_macho | grep -A6 __RESERVED
 	@echo "--- normal ASLR-enabled launch ---"
-	$(BINDIR)/modified_macho /tmp/region_reserver_probe_nonexistent.bin; true
+	$(BINDIR)/modified_macho
 	@echo "--- spawn_noaslr launch ---"
-	$(BINDIR)/spawn_noaslr $(BINDIR)/modified_macho /tmp/region_reserver_probe_nonexistent.bin; true
+	$(BINDIR)/spawn_noaslr $(BINDIR)/modified_macho
 
 # Does MAP_FIXED (and the malloc-guard-page VM-call battery) behave
 # differently against a shared-cache __DATA page before vs. after it's

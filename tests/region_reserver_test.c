@@ -8,44 +8,46 @@
  * for one segment_command_64 (72 bytes), and this refuses to run rather
  * than corrupt the file.
  *
- * Correctness constraints this respects (NOTES.md 2026-09-11):
+ * Correctness constraints this respects (NOTES.md 2026-09-11, 2026-09-14):
  *   - the ORIGINAL load commands are copied byte-for-byte, unshifted, at
  *     their original relative file position -- any change to an existing
  *     segment's/section's fileoff/offset would desync it from the
  *     already-compiled code that references it (adrp/add pairs, GOT/
  *     auth_ptr fixups, symbol values -- all computed at link time against
- *     the ORIGINAL file layout);
- *   - the new segment goes right BEFORE __LINKEDIT, both in load-command
- *     order and in vmaddr, with __LINKEDIT's own vmaddr pushed forward by
- *     one page to make room. This positioning is NOT a codesign
- *     requirement -- NOTES.md 2026-09-11 traced the real rule to Apple's
- *     own source (macho++.cpp MachO::validateStructure()):
+ *     the ORIGINAL file layout). __LINKEDIT itself is no exception here --
+ *     nothing about it is patched either (see next bullet);
+ *   - the new segment's vmaddr is immediately above __LINKEDIT's own
+ *     mapped end (vmaddr + vmsize), plus a small pad, rather than carving
+ *     into __LINKEDIT's own range and pushing its vmaddr forward. That
+ *     address is free simply because __LINKEDIT is the highest-vmaddr
+ *     segment the linker emits -- nothing else claims the space right
+ *     past it. This means __LINKEDIT is NOT touched at all: no need to
+ *     reason about whether moving its vmaddr is safe (it would be --
+ *     dyld always reads __LINKEDIT's location fresh from its load
+ *     command, unlike __TEXT/__DATA_CONST/__DATA, which have compiled-in
+ *     adrp/add references baked against their original addresses -- see
+ *     extend_segment_vmsize.py -- but zero touching beats reasoning about
+ *     why touching would've been fine);
+ *   - the new command is simply APPENDED as the last entry in the
+ *     load-command list -- after __LINKEDIT's own command, not spliced in
+ *     before it. NOTES.md 2026-09-11 traced codesign's actual validation
+ *     rule to Apple's own source (macho++.cpp MachO::validateStructure()):
  *     `seg64->fileoff + seg64->filesize == file length` for __LINKEDIT
- *     specifically, nothing about vmaddr ordering (an earlier "__LINKEDIT
- *     must stay last by vmaddr" hypothesis was tested and found WRONG --
- *     the codesign failure that seemed to confirm it was actually bug 3
- *     below, unrelated file-size accounting). Placing the new segment
- *     exactly where __LINKEDIT used to start is done here purely because
- *     it's the cheapest way to claim a provably free, non-colliding VM
- *     range: that address belonged exclusively to __LINKEDIT before, so
- *     carving one page off its front and sliding its start forward by
- *     that same page can't collide with anything.
- *     Moving __LINKEDIT's vmaddr is the same operation
- *     extend_segment_vmsize.py already relies on as safe: dyld always
- *     reads __LINKEDIT's location fresh from its load command, unlike
- *     __TEXT/__DATA_CONST/__DATA, which have compiled-in adrp/add
- *     references baked against their original addresses and must never
- *     move. __LINKEDIT's fileoff/filesize (where its bytes live on disk)
- *     are untouched -- only where it's *mapped* moves;
- *   - the new segment's vmsize (and the matching shift applied to
- *     __LINKEDIT's vmaddr) is exactly one page, from getpagesize() at
- *     runtime -- 0x4000 on Apple Silicon, not a hardcoded 0x1000 -- so
- *     both the new segment's vmaddr and __LINKEDIT's new vmaddr stay
- *     page-aligned (vm_map/mmap require it). This is a DIFFERENT quantity
- *     from the headerpad slack check below: that one counts free bytes in
- *     the FILE for the new load command struct itself (72 bytes), which
- *     has nothing to do with how much VM address space the new segment
- *     reserves -- conflating the two into one constant was a real bug;
+ *     specifically, nothing about command-list or vmaddr ordering -- two
+ *     hypotheses to the contrary ("__LINKEDIT must stay last by vmaddr",
+ *     "must be grouped with the other LC_SEGMENT_64s") were each tested
+ *     and found WRONG that session. Since list order provably doesn't
+ *     matter, appending is preferred over splicing: one straight-through
+ *     write instead of a three-way split around __LINKEDIT's position;
+ *   - the new segment's vmsize is exactly one page, from getpagesize() at
+ *     runtime -- 0x4000 on Apple Silicon, not a hardcoded guess -- so its
+ *     vmaddr and __LINKEDIT's own (untouched) mapped end both stay
+ *     page-aligned (vm_map/mmap require it; a 2026-09-11 SIGKILL/137
+ *     mystery, root-caused 2026-09-14, was exactly this: a hardcoded
+ *     0x1000 on a 0x4000-page host). This is a DIFFERENT quantity from
+ *     the headerpad slack check below: that one counts free bytes in the
+ *     FILE for the new load command struct itself (72 bytes), unrelated
+ *     to how much VM address space the new segment reserves;
  *   - the new segment is fileoff=0/filesize=0 (no file backing), so it
  *     costs nothing on disk and needs no content to copy correctly.
  *
@@ -67,11 +69,10 @@
 
 #define SEGMENTS_TO_APPEND 1
 #define BUFFER_SIZE (64 * 1024)
-/* Each appended segment reserves exactly one VM page -- read from
- * getpagesize() in main(), not hardcoded, since it's 0x4000 on Apple
- * Silicon vs 0x1000 under Rosetta/x86-64. This is a VM-address-space size
- * and has nothing to do with the headerpad slack check below (that one's
- * a file-byte count for the new load command struct itself). */
+/* Extra gap, in pages, left between __LINKEDIT's mapped end and where the
+ * new reservation starts -- arbitrary safety margin (not load-bearing on
+ * any known constraint), bump here if one is ever found to be needed. */
+#define RESERVATION_PAD_PAGES 1
 
 static void fill_segment_command(struct segment_command_64* seg_cmd, uint64_t vmaddr,
                                   uint64_t vmsize, uint32_t initprot, uint32_t maxprot) {
@@ -130,9 +131,8 @@ int main(int argc, char* argv[]) {
     }
 
     /* Read the ORIGINAL commands into memory -- need to both scan them (for
-     * __LINKEDIT's position/vmaddr and the real slack size) and, unchanged
-     * except for __LINKEDIT's one patched field, write them straight
-     * through afterward. */
+     * __LINKEDIT's extent and the real slack size) and write them straight
+     * through afterward, byte-for-byte, unmodified. */
     uint32_t orig_sizeofcmds = mh.sizeofcmds;
     uint8_t* cmds_buf = malloc(orig_sizeofcmds);
     if (!cmds_buf || fread(cmds_buf, 1, orig_sizeofcmds, f_in) != orig_sizeofcmds) {
@@ -142,7 +142,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    uint32_t linkedit_off = 0;      /* offset of __LINKEDIT's own command within cmds_buf */
     struct segment_command_64* linkedit = NULL;
     long first_content_off = -1;    /* lowest real file offset any section/segment uses */
 
@@ -151,7 +150,6 @@ int main(int argc, char* argv[]) {
         if (lc->cmd == LC_SEGMENT_64) {
             struct segment_command_64* seg = (struct segment_command_64*)lc;
             if (strncmp(seg->segname, "__LINKEDIT", sizeof(seg->segname)) == 0) {
-                linkedit_off = off;
                 linkedit = seg;
             }
             if (seg->nsects == 0) {
@@ -185,26 +183,37 @@ int main(int argc, char* argv[]) {
     }
 
     /* One page, from the actual host -- not a hardcoded guess. Getting this
-     * wrong (e.g. a 4KB literal on a 16KB-page arm64 host) leaves both the
-     * new segment's vmaddr and __LINKEDIT's shifted vmaddr misaligned,
-     * which vm_map/mmap will refuse at map time. */
+     * wrong (e.g. a 4KB literal on a 16KB-page arm64 host) leaves the new
+     * segment's vmaddr misaligned, which vm_map/mmap will refuse at map
+     * time (NOTES.md 2026-09-14 -- this is exactly what caused a
+     * reproducible SIGKILL on every launch before it was found). */
     long sys_page_size = getpagesize();
-    if (sys_page_size <= 0 || linkedit->vmaddr % (uint64_t)sys_page_size != 0) {
-        fprintf(stderr, "__LINKEDIT vmaddr 0x%llx isn't page-aligned (page size %ld) "
-                "-- unexpected Mach-O shape\n",
-                (unsigned long long)linkedit->vmaddr, sys_page_size);
+    if (sys_page_size <= 0) {
+        fprintf(stderr, "getpagesize() returned nonsense (%ld)\n", sys_page_size);
         fclose(f_in);
         free(cmds_buf);
         return 1;
     }
-    uint64_t reserved_vm_size = (uint64_t)sys_page_size; /* one page per appended segment */
+    uint64_t page_size = (uint64_t)sys_page_size;
+    uint64_t reserved_vm_size = page_size; /* one page per appended segment */
 
-    uint64_t new_vmaddr = linkedit->vmaddr; /* new segment takes __LINKEDIT's current spot */
-    printf("new segment at vmaddr 0x%llx (size 0x%llx); __LINKEDIT moves 0x%llx -> 0x%llx\n",
+    /* Reserve above __LINKEDIT's own mapped end rather than inside its
+     * range -- that address is free precisely because __LINKEDIT is the
+     * highest-vmaddr segment the linker emits, so __LINKEDIT itself never
+     * needs to move. */
+    uint64_t linkedit_end = linkedit->vmaddr + linkedit->vmsize;
+    if (linkedit_end % page_size != 0) {
+        fprintf(stderr, "__LINKEDIT's mapped end 0x%llx isn't page-aligned (page size %llu) "
+                "-- unexpected Mach-O shape\n",
+                (unsigned long long)linkedit_end, (unsigned long long)page_size);
+        fclose(f_in);
+        free(cmds_buf);
+        return 1;
+    }
+    uint64_t new_vmaddr = linkedit_end + RESERVATION_PAD_PAGES * page_size;
+    printf("new segment at vmaddr 0x%llx (size 0x%llx), %d page(s) above __LINKEDIT's end (0x%llx)\n",
            (unsigned long long)new_vmaddr, (unsigned long long)reserved_vm_size,
-           (unsigned long long)linkedit->vmaddr,
-           (unsigned long long)(linkedit->vmaddr + reserved_vm_size));
-    linkedit->vmaddr += reserved_vm_size; /* only the VA moves -- fileoff/filesize untouched */
+           RESERVATION_PAD_PAGES, (unsigned long long)linkedit_end);
 
     size_t new_cmds_size = SEGMENTS_TO_APPEND * sizeof(struct segment_command_64);
     long insertion_end = (long)sizeof(mh) + (long)orig_sizeofcmds + (long)new_cmds_size;
@@ -229,17 +238,15 @@ int main(int argc, char* argv[]) {
     fill_segment_command(&new_seg, new_vmaddr, reserved_vm_size,
                           VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE);
 
-    /* header (updated counts) + original commands up to (not including)
-     * __LINKEDIT's, verbatim + the new segment + __LINKEDIT's own command
-     * (with only its vmaddr patched, above) + every command after it,
-     * verbatim -- then everything else copies through untouched from
-     * f_in's now-correctly-advanced cursor. Nothing pre-existing ever
-     * moves in the FILE; only the (previously zero-filled headerpad) slack
-     * gets used, and only __LINKEDIT's vmaddr field changes. */
+    /* header (updated counts) + every original command, byte-for-byte
+     * unmodified (including __LINKEDIT's own) + the new command appended
+     * last -- then everything else copies through untouched from f_in's
+     * now-correctly-advanced cursor. Nothing pre-existing ever moves in
+     * the FILE; only the (previously zero-filled headerpad) slack gets
+     * used, and nothing about any existing command's fields changes. */
     if (write_all(f_out, &mh, sizeof(mh)) != 0 ||
-        write_all(f_out, cmds_buf, linkedit_off) != 0 ||
-        write_all(f_out, &new_seg, sizeof(new_seg)) != 0 ||
-        write_all(f_out, cmds_buf + linkedit_off, orig_sizeofcmds - linkedit_off) != 0) {
+        write_all(f_out, cmds_buf, orig_sizeofcmds) != 0 ||
+        write_all(f_out, &new_seg, sizeof(new_seg)) != 0) {
         fclose(f_in);
         fclose(f_out);
         free(cmds_buf);

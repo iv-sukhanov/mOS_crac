@@ -9,7 +9,7 @@ RETRY_NUMBER ?= 1
 $(BINDIR)/%: %.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello freestanding-spin resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign thread-capture thread-restore thread-run cache-cow-probe reserve-probe full-run-reserved lr-sign-probe cr-capture cr-restore cr-run ucontext-reg-sign thread-state-resign region-reserver-probe
+.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello freestanding-spin resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign thread-capture thread-restore thread-run cache-cow-probe reserve-probe full-run-reserved lr-sign-probe ucontext-reg-sign thread-state-resign region-reserver-probe
 
 checkpoint: $(BINDIR)/sim_checkpoint_test
 	$(BINDIR)/sim_checkpoint_test checkpoint $(CKPT_FILE)
@@ -134,36 +134,16 @@ thread-restore: thread_restore_test.c $(BINDIR)/spawn_noaslr
 
 thread-run: thread-capture thread-restore
 
-# cr_test.c's do_capture(), single-threaded self-capture (2026-09-03) --
-# needs -arch arm64e itself now (unlike thread_capture_test.c), so this
-# gets an _e suffix like the arm64e capture builds used ad hoc this
-# session, distinguishing it from any future plain-arm64 cr_* build.
-
 # crac_daemon.c -- idle "T-" PAC-key anchor (NOTES.md 2026-09-10). Must be
 # arm64e (only an arm64e, non-platform, ad-hoc-signed binary lands in the
-# kernel's "T-" bucket at all) and must sit next to cr_capture_driver_e /
-# cr_restore_driver -- do_capture()'s find_or_launch_daemon() resolves it
-# relative to its own running path, not a hardcoded location.
+# kernel's "T-" bucket at all). Used by src/Makefile's cr-capture, which
+# builds this from here (../tests/crac_daemon.c) into its own build/ dir --
+# this rule is kept for building/testing it standalone from tests/ too.
 $(BINDIR)/crac_daemon: crac_daemon.c
 	$(CC) $(CFLAGS) -arch arm64e -o $(BINDIR)/crac_daemon crac_daemon.c
 
-cr-capture: cr_capture_driver.c $(BINDIR)/crac_daemon
-	$(CC) $(CFLAGS) -arch arm64e -o $(BINDIR)/cr_capture_driver_e cr_capture_driver.c
-	$(BINDIR)/cr_capture_driver_e $(CKPT_FILE)
-
-# cr_test.c's do_restore() -- same segment-reservation/codesign/spawn_noaslr
-# shape as thread-restore (same reason: whole-process guard-page collision,
-# still unsolved -- NOTES.md 2026-09-03), signal-based resume mechanism
-# instead of thread-restore's trampoline. Currently expected to fail at
-# sigreturn's PAC check on the resumed pc -- see NOTES.md 2026-09-03.
-cr-restore: cr_restore_driver.c $(BINDIR)/spawn_noaslr
-	$(CC) $(CFLAGS) -arch arm64e -o $(BINDIR)/cr_restore_driver cr_restore_driver.c
-	python3 extend_segment_vmsize.py $(BINDIR)/cr_restore_driver __DATA vmsize=0x50004000
-	python3 extend_segment_vmsize.py $(BINDIR)/cr_restore_driver __LINKEDIT vmaddr=0x15000c000
-	codesign -s - -f $(BINDIR)/cr_restore_driver
-	$(BINDIR)/spawn_noaslr -r $(RETRY_NUMBER) $(BINDIR)/cr_restore_driver $(CKPT_FILE)
-
-cr-run: cr-capture cr-restore
+# cr_capture_driver.c / cr_restore_driver.c / cr_common.* moved to src/
+# 2026-09-14 (NOTES.md) -- see src/Makefile's cr-capture/cr-restore/cr-run.
 
 # Inserts a brand-new LC_SEGMENT_64 (__RESERVED, pure VM reservation, no
 # file backing) into an arm64e binary's headerpad slack, rather than

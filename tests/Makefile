@@ -9,7 +9,7 @@ RETRY_NUMBER ?= 1
 $(BINDIR)/%: %.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello freestanding-spin resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign thread-capture thread-restore thread-run cache-cow-probe reserve-probe full-run-reserved lr-sign-probe cr-capture cr-restore cr-run ucontext-reg-sign thread-state-resign
+.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello freestanding-spin resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign thread-capture thread-restore thread-run cache-cow-probe reserve-probe full-run-reserved lr-sign-probe cr-capture cr-restore cr-run ucontext-reg-sign thread-state-resign region-reserver-probe
 
 checkpoint: $(BINDIR)/sim_checkpoint_test
 	$(BINDIR)/sim_checkpoint_test checkpoint $(CKPT_FILE)
@@ -164,6 +164,30 @@ cr-restore: cr_restore_driver.c $(BINDIR)/spawn_noaslr
 	$(BINDIR)/spawn_noaslr -r $(RETRY_NUMBER) $(BINDIR)/cr_restore_driver $(CKPT_FILE)
 
 cr-run: cr-capture cr-restore
+
+# Inserts a brand-new LC_SEGMENT_64 (__RESERVED, pure VM reservation, no
+# file backing) into an arm64e binary's headerpad slack, rather than
+# growing/relocating an existing segment -- NOTES.md 2026-09-11
+# "new-LC_SEGMENT_64" discussion. Needs the target built with -headerpad
+# first; region_reserver_test.c refuses to run rather than corrupt the file
+# if there isn't enough real slack. Both launches below are expected to
+# succeed and print the driver's own "fopen: No such file or directory"
+# for the nonexistent probe arg -- exit 1, not a crash. (NOTES.md
+# 2026-09-11 logged a SIGKILL/137 on both launches as an open mystery;
+# NOTES.md 2026-09-14 traced it to a page-alignment bug -- RESERVED_SPACE
+# was 0x1000 while this host's real page size is 0x4000 -- now fixed.)
+region-reserver-probe: region_reserver_test.c $(BINDIR)/spawn_noaslr
+	$(CC) $(CFLAGS) -o $(BINDIR)/region_reserver_test region_reserver_test.c
+	$(CC) $(CFLAGS) -arch arm64e -Wl,-headerpad,0x1000 -o $(BINDIR)/cr_restore_driver_hp cr_restore_driver.c
+	cd $(BINDIR) && ./region_reserver_test cr_restore_driver_hp
+	chmod +x $(BINDIR)/modified_macho
+	codesign -s - -f $(BINDIR)/modified_macho
+	@echo "--- new segment ---"
+	otool -l $(BINDIR)/modified_macho | grep -A6 __RESERVED
+	@echo "--- normal ASLR-enabled launch ---"
+	$(BINDIR)/modified_macho /tmp/region_reserver_probe_nonexistent.bin; true
+	@echo "--- spawn_noaslr launch ---"
+	$(BINDIR)/spawn_noaslr $(BINDIR)/modified_macho /tmp/region_reserver_probe_nonexistent.bin; true
 
 # Does MAP_FIXED (and the malloc-guard-page VM-call battery) behave
 # differently against a shared-cache __DATA page before vs. after it's

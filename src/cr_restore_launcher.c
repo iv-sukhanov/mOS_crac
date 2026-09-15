@@ -27,6 +27,7 @@
 #include <mach-o/loader.h>
 #include <mach/vm_prot.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <limits.h>
 #include <assert.h>
@@ -41,6 +42,7 @@
 
 #define BUFFER_SIZE (64 * 1024)
 #define PATCHED_PATH_SIZE PATH_MAX
+#define PATCHED_FILE_MODE 0755
 
 extern char **environ;
 
@@ -95,12 +97,12 @@ static void patched_binary_path(const char* orig_path, char* out, size_t outsz) 
     snprintf(out, outsz, "%s.patched", orig_path);
 }
 
-static void fill_segment_command(struct segment_command_64* seg_cmd, uint64_t vmaddr,
+static void fill_segment_command(struct segment_command_64* seg_cmd, uint32_t index, uint64_t vmaddr,
                                   uint64_t vmsize, uint32_t initprot, uint32_t maxprot) {
     memset(seg_cmd, 0, sizeof(*seg_cmd));
     seg_cmd->cmd = LC_SEGMENT_64;
     seg_cmd->cmdsize = sizeof(*seg_cmd);
-    memcpy(seg_cmd->segname, "__RESERVED", sizeof("__RESERVED"));
+    snprintf((char*)seg_cmd->segname, sizeof(seg_cmd->segname), "__RESERVED%u", index);
     seg_cmd->vmaddr = vmaddr;
     seg_cmd->vmsize = vmsize;
     seg_cmd->fileoff = 0; /* no file backing */
@@ -127,33 +129,18 @@ static bool lookup_identical_cache_region(region_desc_t* region) {
 static uint32_t strip_dyld_cache_regions(struct segment_command_64* new_segs, region_desc_t* regions, uint32_t region_count) {
     uint32_t new_segs_count = 0;
     for (uint32_t i = 0; i < region_count; i++) {
-        /* Skip reserving a region only when BOTH signals agree it's dyld
-         * shared cache: the capture-side approximations (path/range/submap
-         * checks) -- can misfire, e.g. a JIT blob landing inside the cache's
-         * address range) AND this launcher's own cross-process check
-         * (identical {addr,len,prot} already mapped in ITS address space --
-         * strong evidence, since the cache sits at the same fixed address
-         * in every process, but not definitive alone either). Requiring
-         * both is the conservative choice: worst case a real cache region
-         * gets reserved anyway (harmless, just unnecessary), never the
-         * reverse. */
+        /* Skip cache regions that are already mapped identically */
         if ((in_shared_cache_range(regions[i].addr) || in_shared_cache_submap(regions[i].addr)) &&
             lookup_identical_cache_region(&regions[i])) {
             continue;
         }
-        /* Compact into new_segs[0..new_segs_count) -- indexing by the
-         * write count, not by i, since skipped regions would otherwise
-         * leave gaps of uninitialized entries inside the written range. */
-        fill_segment_command(&new_segs[new_segs_count], regions[i].addr, regions[i].len,
+        fill_segment_command(&new_segs[new_segs_count], new_segs_count, regions[i].addr, regions[i].len,
                              regions[i].protection, regions[i].protection);
         new_segs_count++;
         printf("  reserving region[%u] [0x%llx,0x%llx) %.2fMB prot=%u\n", i,
                (uint64_t)regions[i].addr,
                (uint64_t)(regions[i].addr + regions[i].len),
-               regions[i].len / (1024.0 * 1024.0), regions[i].protection);
-        if (new_segs_count == 1) { //to test with only one region at first
-            break;
-        }        
+               regions[i].len / (1024.0 * 1024.0), regions[i].protection);     
     }
     return new_segs_count;
 }
@@ -210,6 +197,12 @@ static int write_patched_macho(
     }
     if (copy_remaining_file(f_in, f_out) != 0) {
         perror("copy_remaining_file");
+        fclose(f_out);
+        return -1;
+    }
+
+    if (fchmod(fileno(f_out), PATCHED_FILE_MODE) != 0) {
+        perror("fchmod");
         fclose(f_out);
         return -1;
     }

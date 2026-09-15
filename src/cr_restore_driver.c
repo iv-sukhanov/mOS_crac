@@ -27,6 +27,7 @@
 #define NUMBER_OF_ARGS 3
 
 #define BUFFER_SIZE (64 * 1024)
+#define PATCHED_PATH_SIZE PATH_MAX
 
 extern char **environ;
 
@@ -99,27 +100,30 @@ static void fill_segment_command(struct segment_command_64* seg_cmd, uint64_t vm
 
 static bool lookup_identical_cache_region(region_desc_t* region) {
     mach_vm_address_t a = region->addr;
-        mach_vm_size_t size = 0;
-        natural_t depth = 32;
-        vm_region_submap_info_data_64_t info;
-        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
-        kern_return_t kr = mach_vm_region_recurse(mach_task_self(), &a, &size, &depth,
-                                                   (vm_region_recurse_info_t)&info, &count);
-        if (kr != KERN_SUCCESS) return false;
+    mach_vm_size_t size = 0;
+    natural_t depth = 32;
+    vm_region_submap_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+    kern_return_t kr = mach_vm_region_recurse(mach_task_self(), &a, &size, &depth,
+                                               (vm_region_recurse_info_t)&info, &count);
+    if (kr != KERN_SUCCESS) return false;
 
-        return a == region->addr && size == region->len && (uint32_t)info.protection == region->protection;
+    return a == region->addr && size == region->len && (uint32_t)info.protection == region->protection;
 }
 
-static size_t strip_dydl_cache_regions(struct segment_command_64* new_segs, region_desc_t* regions, uint32_t region_count) {
+static size_t strip_dyld_cache_regions(struct segment_command_64* new_segs, region_desc_t* regions, uint32_t region_count) {
     size_t new_segs_count = 0;
     for (uint32_t i = 0; i < region_count; i++) {
         if (lookup_identical_cache_region(&regions[i])) {
             /* Skip this region, don't add a new segment for it. */
             continue;
         }
-        new_segs_count++;
-        fill_segment_command(&new_segs[i], regions[i].addr, regions[i].len,
+        /* Compact into new_segs[0..new_segs_count) -- indexing by the
+         * write count, not by i, since skipped regions would otherwise
+         * leave gaps of uninitialized entries inside the written range. */
+        fill_segment_command(&new_segs[new_segs_count], regions[i].addr, regions[i].len,
                              regions[i].protection, regions[i].protection);
+        new_segs_count++;
     }
     return new_segs_count;
 }
@@ -132,7 +136,7 @@ static int write_patched_macho(
 
     assert(mh && regions && cmds_buf && path && patched && region_count > 0);
     
-    patched_binary_path(path, patched, sizeof(patched));
+    patched_binary_path(path, patched, PATCHED_PATH_SIZE);
 
     FILE* f_out = fopen(patched, "wb");
     if (!f_out) { perror("fopen"); return -1; }
@@ -151,9 +155,9 @@ static int write_patched_macho(
     }
 
     struct segment_command_64 new_segs[MAX_REGIONS];
-    size_t new_segs_count = strip_dydl_cache_regions(new_segs, regions, region_count);
+    size_t new_segs_count = strip_dyld_cache_regions(new_segs, regions, region_count);
 
-    if (write_all(f_out, &mh, sizeof(*mh)) != 0 ||
+    if (write_all(f_out, mh, sizeof(*mh)) != 0 ||
         write_all(f_out, cmds_buf, orig_sizeofcmds) != 0 ||
         write_all(f_out, new_segs, new_segs_count * sizeof(*new_segs)) != 0) {
         perror("write_all");
@@ -257,7 +261,7 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    char patched_path[PATH_MAX];
+    char patched_path[PATCHED_PATH_SIZE];
     if (reserve_regions(argv[EXE_ARG_INDEX], patched_path, argv[CKPT_ARG_INDEX]) != 0) {
         fprintf(stderr, "reserve_regions failed\n");
         return 1;

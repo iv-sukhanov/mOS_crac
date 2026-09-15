@@ -160,7 +160,7 @@ static int daemon_binary_path(char* out, size_t outsz) {
 
 /* Match by comm name (what `ps`/proc_name() report) -- unprivileged. */
 static pid_t find_running_daemon(void) {
-    pid_t pids[4096];
+    pid_t pids[4096]; // TODO: get rid of hard-coded limit
     int bytes = proc_listpids(PROC_ALL_PIDS, 0, pids, sizeof(pids));
     if (bytes <= 0) return -1;
     int n = bytes / (int)sizeof(pid_t);

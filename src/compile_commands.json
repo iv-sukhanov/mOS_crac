@@ -81,5 +81,37 @@
     ],
     "directory": "/Users/isukhanov/repos/mos_crac/src",
     "output": "build/cr_restore_driver"
+  },
+  {
+    "file": "cr_restore_launcher.c",
+    "arguments": [
+      "/usr/bin/cc",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-arch",
+      "arm64e",
+      "-o",
+      "build/cr_restore_launcher",
+      "cr_restore_launcher.c"
+    ],
+    "directory": "/Users/isukhanov/repos/mos_crac/src",
+    "output": "build/cr_restore_launcher"
+  },
+  {
+    "file": "../tests/crac_daemon.c",
+    "arguments": [
+      "/usr/bin/cc",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-arch",
+      "arm64e",
+      "-o",
+      "build/crac_daemon",
+      "../tests/crac_daemon.c"
+    ],
+    "directory": "/Users/isukhanov/repos/mos_crac/src",
+    "output": "build/crac_daemon"
   }
 ]

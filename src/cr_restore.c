@@ -112,15 +112,7 @@ static bool is_cache_region(uint64_t addr) {
     return in_shared_cache_range((mach_vm_address_t)addr) || in_shared_cache_submap((mach_vm_address_t)addr);
 }
 
-/* Is [addr, addr+len) already covered by one existing mapping? Either our
- * own launcher-reserved placeholder (initprot RW, see
- * cr_restore_launcher.c's fill_segment_command()) or the real shared-cache
- * mapping dyld set up at process start -- either way, `mach_vm_region_recurse`
- * (depth 32, same as cr_restore_launcher.c's lookup_identical_cache_region())
- * finds it, and `*out_prot` comes back as its current protection. `a != addr`
- * covers the case where nothing starts exactly there (the call returns the
- * next mapped region at or after `addr` instead); `size < len` covers a
- * same-start mapping too small to cover the whole region. */
+/* Tells if [addr, addr+len) already covered by one existing mapping */
 static bool query_existing_mapping(uint64_t addr, uint64_t len, int* out_prot) {
     mach_vm_address_t a = addr;
     mach_vm_size_t size = 0;
@@ -129,27 +121,13 @@ static bool query_existing_mapping(uint64_t addr, uint64_t len, int* out_prot) {
     mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
     kern_return_t kr = mach_vm_region_recurse(mach_task_self(), &a, &size, &depth,
                                                (vm_region_recurse_info_t)&info, &count);
-    if (kr != KERN_SUCCESS || a != addr || size < len) return false;
+    if (kr != KERN_SUCCESS || a > addr || a + size < addr + len) return false;
 
     *out_prot = (int)info.protection;
     return true;
 }
 
-/* Restore one classified region's bytes at its original address, then its
- * final protection. `fatal`: the non-cache pass exits EX_TEMPFAIL on an
- * ENOMEM address collision so a retry wrapper can try a fresh process; the
- * cache pass logs and skips an unmappable region -- partial cache replay
- * is expected.
- *
- * Prefers writing straight into whatever's already mapped there over
- * mmap(MAP_FIXED)'s unmap-then-anon-remap: that replacement opens a real
- * window where the address reads as zero between the mmap and the memcpy
- * meant to fix it back up -- fine for ordinary data, but a problem for a
- * page other code still depends on mid-restore (e.g. a shared-cache
- * __DATA slot holding a resolved ifunc dispatch pointer: mmap zeroes it,
- * and the memcpy() call needed to restore it may itself indirect through
- * that exact now-null pointer). mmap(MAP_FIXED) is now only the fallback
- * for a region nothing already covers. */
+/* Write one region's bytes at its original address, then its final protection. */
 static int remap_one_region(uint32_t i, bool fatal) {
     uint64_t addr = g_regions[i].addr;
     uint64_t len  = g_regions[i].len;

@@ -128,10 +128,10 @@ static uint32_t strip_dyld_cache_regions(struct segment_command_64* new_segs, re
         }
         fill_segment_command(&new_segs[new_segs_count], new_segs_count, regions[i].addr, regions[i].len);
         new_segs_count++;
-        printf("  reserving region[%u] [0x%llx,0x%llx) %.2fMB prot=%u\n", i,
+        printf("  reserving region[%u] [0x%llx,0x%llx) %.2fMB (%llu bytes prot=%u)\n", i,
                (uint64_t)regions[i].addr,
                (uint64_t)(regions[i].addr + regions[i].len),
-               regions[i].len / (1024.0 * 1024.0), regions[i].protection);     
+               regions[i].len / (1024.0 * 1024.0), regions[i].len, regions[i].protection);     
     }
     return new_segs_count;
 }

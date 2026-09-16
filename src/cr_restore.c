@@ -142,26 +142,18 @@ static int remap_one_region(uint32_t i, bool fatal) {
                     fatal ? "" : " -- skipped");
             return fatal ? 1 : 0;
         }
-        printf("  region[%u] [0x%llx,0x%llx): writing %llu bytes into existing mapping\n",
-               i, (uint64_t)addr, (uint64_t)(addr + len), (uint64_t)len);
         memcpy((void*)(uintptr_t)addr, g_restore_buf + g_region_off[i], len);
     } else {
         void* got = mmap((void*)(uintptr_t)addr, len, PROT_READ | PROT_WRITE,
                          MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
         if (got == MAP_FAILED || (uint64_t)(uintptr_t)got != addr) {
-            int e = errno;
             fprintf(stderr, "  region[%u] [0x%llx,0x%llx): %s%s\n", i,
                     (uint64_t)addr, (uint64_t)(addr + len),
-                    got == MAP_FAILED ? strerror(e) : "fixed address not honored",
+                    got == MAP_FAILED ? strerror(errno) : "fixed address not honored",
                     fatal ? "" : " -- skipped");
-            if (!fatal) return 0;
-            if (got == MAP_FAILED && e == ENOMEM) {
-                fprintf(stderr, "  exiting EX_TEMPFAIL for a retry wrapper to try a fresh process\n");
-                exit(EX_TEMPFAIL);
-            }
-            return 1;
+            return fatal ? 1 : 0;
         }
-        printf("  region[%u] [0x%llx,0x%llx): writing %llu bytes into new mapping\n",
+        printf("  WARNING: region[%u] [0x%llx,0x%llx): writing %llu bytes into NEW mapping\n",
                i, (uint64_t)addr, (uint64_t)(addr + len), (uint64_t)len);
         memcpy(got, g_restore_buf + g_region_off[i], len);
     }

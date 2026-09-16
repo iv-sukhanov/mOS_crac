@@ -28,6 +28,9 @@
 #include <mach/vm_prot.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/clonefile.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <limits.h>
 #include <assert.h>
@@ -40,28 +43,17 @@
 #define CKPT_ARG_INDEX 2
 #define NUMBER_OF_ARGS 3
 
-#define BUFFER_SIZE (64 * 1024)
 #define PATCHED_PATH_SIZE PATH_MAX
 #define PATCHED_FILE_MODE 0755
 
 extern char **environ;
 
-static int write_all(FILE* f, const void* buf, size_t n) {
+static int pwrite_all(int fd, const void* buf, size_t n, off_t off) {
     if (n == 0) return 0;
-    if (fwrite(buf, 1, n, f) != n) {
-        fprintf(stderr, "short write (%zu bytes)\n", n);
+    if (pwrite(fd, buf, n, off) != (ssize_t)n) {
+        fprintf(stderr, "short pwrite at offset %lld (%zu bytes)\n", (long long)off, n);
         return -1;
     }
-    return 0;
-}
-
-static int copy_remaining_file(FILE* src, FILE* dest) {
-    uint8_t buffer[BUFFER_SIZE];
-    size_t bytes_read;
-    while ((bytes_read = fread(buffer, 1, sizeof(buffer), src)) > 0) {
-        if (write_all(dest, buffer, bytes_read) != 0) return -1;
-    }
-    if (ferror(src)) { perror("fread"); return -1; }
     return 0;
 }
 
@@ -146,23 +138,22 @@ static uint32_t strip_dyld_cache_regions(struct segment_command_64* new_segs, re
 }
 
 static int write_patched_macho(
-    region_desc_t* regions, uint32_t region_count, 
-    struct mach_header_64* mh, uint8_t* cmds_buf, uint32_t orig_sizeofcmds,
-    FILE* f_in,
+    region_desc_t* regions, uint32_t region_count,
+    struct mach_header_64* mh, long first_content_off,
     const char* path, char* patched) {
 
-    assert(mh && regions && cmds_buf && path && patched && region_count > 0);
-    
+    assert(mh && regions && path && patched && region_count > 0);
+    size_t orig_sizeofcmds = mh->sizeofcmds;
+
     patched_binary_path(path, patched, PATCHED_PATH_SIZE);
 
-    FILE* f_out = fopen(patched, "wb");
-    if (!f_out) { perror("fopen"); return -1; }
+    unlink(patched);
+    if (clonefile(path, patched, 0) != 0) { perror("clonefile"); return -1; }
 
     struct segment_command_64 new_segs[MAX_REGIONS];
     uint32_t new_segs_count = strip_dyld_cache_regions(new_segs, regions, region_count);
 
     size_t new_cmds_size = new_segs_count * sizeof(struct segment_command_64);
-    long first_content_off = find_first_content_off(cmds_buf, orig_sizeofcmds);
     long insertion_end = (long)sizeof(*mh) + (long)orig_sizeofcmds + (long)new_cmds_size;
     if (first_content_off >= 0 && insertion_end > first_content_off) {
         fprintf(stderr,
@@ -170,44 +161,26 @@ static int write_patched_macho(
                 "but real content starts at %ld -- rebuild the target with a bigger "
                 "-headerpad and try again\n",
                 insertion_end, first_content_off);
-        fclose(f_out);
         return -1;
     }
+
+    printf("writing patched Mach-O to %s: %u new LC_SEGMENT_64(s), "
+           "appended to original %u load command(s)\n",
+           patched, new_segs_count, mh->ncmds);
 
     mh->ncmds += new_segs_count;
     mh->sizeofcmds += (uint32_t)new_cmds_size;
 
-    printf("writing patched Mach-O to %s: %u new LC_SEGMENT_64(s) (%.2fMB total) "
-           "appended to original %u load command(s) (%.2fMB total)\n",
-           patched, new_segs_count, new_cmds_size / (1024.0 * 1024.0),
-           mh->ncmds, orig_sizeofcmds / (1024.0 * 1024.0));
+    int fd = open(patched, O_WRONLY);
+    if (fd < 0) { perror("open"); return -1; }
 
-    if (write_all(f_out, mh, sizeof(*mh)) != 0 ||
-        write_all(f_out, cmds_buf, orig_sizeofcmds) != 0 ||
-        write_all(f_out, new_segs, new_segs_count * sizeof(*new_segs)) != 0) {
-        perror("write_all");
-        fclose(f_out);
+    if (pwrite_all(fd, mh, sizeof(*mh), 0) != 0 ||
+        pwrite_all(fd, new_segs, new_cmds_size, (off_t)sizeof(*mh) + orig_sizeofcmds) != 0) {
+        close(fd);
         return -1;
     }
 
-    if (fseek(f_in, (long)new_cmds_size, SEEK_CUR) != 0) {
-        perror("fseek");
-        fclose(f_out);
-        return -1;
-    }
-    if (copy_remaining_file(f_in, f_out) != 0) {
-        perror("copy_remaining_file");
-        fclose(f_out);
-        return -1;
-    }
-
-    if (fchmod(fileno(f_out), PATCHED_FILE_MODE) != 0) {
-        perror("fchmod");
-        fclose(f_out);
-        return -1;
-    }
-
-    fclose(f_out);
+    close(fd);
     return 0;
 }
 
@@ -240,10 +213,6 @@ static int read_ckpt_regions(const char* ckpt_file, region_desc_t* regions, uint
     return 0;
 }
 
-/* Ad-hoc re-sign: editing load commands post-link invalidates whatever
- * signature was there, and the kernel checks it at exec time. posix_spawn,
- * not system() -- path is derived from argv, and system() would shell-
- * interpret it instead of passing it as one literal argv entry. */
 static int codesign_binary(const char* path) {
     char* argv[] = { "/usr/bin/codesign", "-s", "-", "-f", (char*)path, NULL };
     pid_t pid;
@@ -282,25 +251,23 @@ static int reserve_regions(const char* path, char* patched, const char* ckpt_fil
     if (!cmds_buf || fread(cmds_buf, 1, orig_sizeofcmds, f_in) != orig_sizeofcmds) {
         fprintf(stderr, "short read on load commands\n");
         fclose(f_in);
-        return -1;
-    }
-
-    region_desc_t regions[MAX_REGIONS];
-    uint32_t region_count;
-    if (read_ckpt_regions(ckpt_file, regions, &region_count) != 0) {
-        fclose(f_in);
-        free(cmds_buf);
-        return -1;
-    }
-
-    if (write_patched_macho(regions, region_count, &mh, cmds_buf, orig_sizeofcmds, f_in, path, patched) != 0) {
-        fclose(f_in);
         free(cmds_buf);
         return -1;
     }
     fclose(f_in);
+
+    long first_content_off = find_first_content_off(cmds_buf, orig_sizeofcmds);
     free(cmds_buf);
-    cmds_buf = NULL;
+
+    region_desc_t regions[MAX_REGIONS];
+    uint32_t region_count;
+    if (read_ckpt_regions(ckpt_file, regions, &region_count) != 0) {
+        return -1;
+    }
+
+    if (write_patched_macho(regions, region_count, &mh, first_content_off, path, patched) != 0) {
+        return -1;
+    }
 
     if (codesign_binary(patched) != 0) return -1;
     return 0;

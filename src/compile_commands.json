@@ -1,5 +1,38 @@
 [
   {
+    "file": "cr_restore.c",
+    "arguments": [
+      "/usr/bin/cc",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-arch",
+      "arm64e",
+      "-c",
+      "-o",
+      "build/cr_restore.o",
+      "cr_restore.c"
+    ],
+    "directory": "/Users/isukhanov/repos/mos_crac/src",
+    "output": "build/cr_restore.o"
+  },
+  {
+    "file": "cr_restore_driver.c",
+    "arguments": [
+      "/usr/bin/cc",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-arch",
+      "arm64e",
+      "-o",
+      "build/cr_restore_driver",
+      "cr_restore_driver.c"
+    ],
+    "directory": "/Users/isukhanov/repos/mos_crac/src",
+    "output": "build/cr_restore_driver"
+  },
+  {
     "file": "cr_restore_launcher.c",
     "arguments": [
       "/usr/bin/cc",

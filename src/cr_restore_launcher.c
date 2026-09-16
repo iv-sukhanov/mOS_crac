@@ -90,7 +90,7 @@ static void patched_binary_path(const char* orig_path, char* out, size_t outsz) 
 }
 
 static void fill_segment_command(struct segment_command_64* seg_cmd, uint32_t index, uint64_t vmaddr,
-                                  uint64_t vmsize, uint32_t initprot, uint32_t maxprot) {
+                                  uint64_t vmsize) {
     memset(seg_cmd, 0, sizeof(*seg_cmd));
     seg_cmd->cmd = LC_SEGMENT_64;
     seg_cmd->cmdsize = sizeof(*seg_cmd);
@@ -99,8 +99,8 @@ static void fill_segment_command(struct segment_command_64* seg_cmd, uint32_t in
     seg_cmd->vmsize = vmsize;
     seg_cmd->fileoff = 0; /* no file backing */
     seg_cmd->filesize = 0;
-    seg_cmd->maxprot = maxprot;
-    seg_cmd->initprot = initprot;
+    seg_cmd->initprot = VM_PROT_READ | VM_PROT_WRITE;
+    seg_cmd->maxprot = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
     seg_cmd->nsects = 0;
     seg_cmd->flags = 0;
 }
@@ -126,8 +126,7 @@ static uint32_t strip_dyld_cache_regions(struct segment_command_64* new_segs, re
             lookup_identical_cache_region(&regions[i])) {
             continue;
         }
-        fill_segment_command(&new_segs[new_segs_count], new_segs_count, regions[i].addr, regions[i].len,
-                             regions[i].protection, regions[i].protection);
+        fill_segment_command(&new_segs[new_segs_count], new_segs_count, regions[i].addr, regions[i].len);
         new_segs_count++;
         printf("  reserving region[%u] [0x%llx,0x%llx) %.2fMB prot=%u\n", i,
                (uint64_t)regions[i].addr,

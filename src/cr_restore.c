@@ -19,13 +19,10 @@
  * Every captured pc/lr/sp/fp is a real PAC-signed value that must be
  * re-signed on restore, not a plain address.
  *
- * ORDERING matters because the cache-region remap pass overwrites the live
- * pthread "munge" global with the captured process's value:
- *   remap non-cache regions
- *   -> recover THIS process's munge, sign the worker struct with it
- *   -> __bsdthread_create(SUSPENDED)      (munge global still ours)
- *   -> remap cache regions                (munge global now = hdr.munge)
- *   -> re-sign the worker struct with hdr.munge to match
+ * ORDERING:
+ *   -> remap all regions                  (munge global -> hdr.munge)
+ *   -> sign the worker struct with hdr.munge
+ *   -> __bsdthread_create(SUSPENDED)
  *   -> resolve worker port, thread_set_state(GPR+NEON)
  *   -> pthread_kill(SIGUSR1) while suspended
  *   -> thread_resume()
@@ -199,11 +196,9 @@ static int remap_one_region(uint32_t i, bool fatal) {
     return 0;
 }
 
-/* cache=false: non-cache regions, before __bsdthread_create(). cache=true:
- * shared-cache regions, after it (that pass clobbers the munge global). */
-static int remap_regions(uint32_t region_count, bool cache) {
+static int remap_regions(uint32_t region_count) {
     for (uint32_t i = 0; i < region_count; i++) {
-        if (is_cache_region(g_regions[i].addr) != cache) continue;
+        bool cache = is_cache_region(g_regions[i].addr);
         if (remap_one_region(i, !cache) != 0) return 1;
     }
     return 0;
@@ -303,19 +298,13 @@ int do_restore(const char* path) {
                CRAC_DAEMON_NAME, hdr.daemon_pid, strerror(errno));
     }
 
-    if (remap_regions(hdr.region_count, false) != 0) { fprintf(stderr, "failed to remap regions\n"); return 1; }
-    printf("non-cache regions remapped at their original addresses\n");
-
-    /* Recover THIS process's live munge, sign the worker struct with it
-     * now, while the munge global still holds this value. */
-    uintptr_t self_addr = (uintptr_t)pthread_self();
-    uintptr_t stored_sig = *(uintptr_t *)self_addr;
-    uintptr_t new_munge = stored_sig ^ sign_for_addr(self_addr);
+    if (remap_regions(hdr.region_count) != 0) { fprintf(stderr, "failed to remap regions\n"); return 1; }
+    printf("regions remapped at their original addresses\n");
 
     uintptr_t worker_addr = (uintptr_t)hdr.pthread_addr;
-    uintptr_t sig_v1 = sign_for_addr(worker_addr) ^ new_munge;
-    *(uintptr_t *)worker_addr = sig_v1;
-    printf("signed worker struct pre-cache-remap: munge=0x%lx sig=0x%lx\n", new_munge, sig_v1);
+    uintptr_t sig = sign_for_addr(worker_addr) ^ (uintptr_t)hdr.munge;
+    *(uintptr_t *)worker_addr = sig;
+    printf("signed worker struct: munge=0x%llx sig=0x%lx\n", (uint64_t)hdr.munge, sig);
 
     void* stack = malloc(STACK_SIZE);
     if (!stack) { perror("malloc stack"); return 1; }
@@ -335,13 +324,6 @@ int do_restore(const char* path) {
         return 1;
     }
     printf("__bsdthread_create returned %p (suspended)\n", ret);
-
-    remap_regions(hdr.region_count, true); /* clobbers the munge global -- expected */
-
-    uintptr_t sig_v2 = sign_for_addr(worker_addr) ^ (uintptr_t)hdr.munge;
-    *(uintptr_t *)worker_addr = sig_v2;
-    printf("re-signed worker struct post-cache-remap: munge=0x%llx sig=0x%lx\n",
-        (uint64_t)hdr.munge, sig_v2);
 
     pthread_t worker_pt = (pthread_t)(uintptr_t)hdr.pthread_addr;
 

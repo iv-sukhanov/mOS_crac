@@ -45,6 +45,15 @@ extern char **environ;
 
 #define CRAC_DAEMON_PIDFILE "/tmp/crac_daemon.pid"
 
+/* TODO: task_threads()'s own out-of-line `acts` array (do_capture()) has
+ * to exist before classify_regions() runs (needed to suspend everyone
+ * first), so it always ends up captured as an ordinary region -- and
+ * these static globals get captured too, as part of this file's own data
+ * segment, no matter when anything here runs. Reconsider whether
+ * capture-tool-internal state should be excluded from the checkpoint at
+ * all (the way shared-cache pages already are) rather than accepted as
+ * unavoidable -- not done here since it doesn't change capture_used size
+ * either way (the data segment is captured as one region regardless). */
 static region_desc_t g_regions[MAX_REGIONS];
 static void*         g_region_bufs[MAX_REGIONS];
 static uint32_t      g_region_count;
@@ -244,6 +253,18 @@ static pid_t find_or_launch_daemon(void) {
     return pid;
 }
 
+/* Resume every non-main thread in acts[0, count) */
+static void resume_threads(thread_act_array_t acts, mach_msg_type_number_t count, mach_port_t main_port) {
+    for (mach_msg_type_number_t i = 0; i < count; i++) {
+        if (acts[i] == main_port) continue;
+        if (thread_resume(acts[i]) != KERN_SUCCESS) {
+            fprintf(stderr, "thread_resume failed for thread[%u]\n", i);
+            continue;
+        }
+        printf("resumed thread[%u] port=0x%x\n", i, acts[i]);
+    }
+}
+
 int do_capture(const char* path) {
     /* volatile: force a real load on each check below, since a restored
      * thread's GPRs are seeded from what was resident at capture time. */
@@ -258,18 +279,6 @@ int do_capture(const char* path) {
     sa.__sigaction_u.__sa_sigaction = capture_state;
     if (sigaction(SIGUSR1, &sa, NULL) == -1) { perror("sigaction"); return 1; }
 
-    if (classify_regions() != 0) return 1;
-    uint64_t total = 0;
-    for (uint32_t i = 0; i < g_region_count; i++) {
-        total += g_regions[i].len;
-        printf("  region[%u] [0x%llx,0x%llx) %.2fMB prot=%u\n", i,
-               (uint64_t)g_regions[i].addr,
-               (uint64_t)(g_regions[i].addr + g_regions[i].len),
-               g_regions[i].len / (1024.0 * 1024.0), g_regions[i].protection);
-    }
-    printf("classified %u regions, %.2f MB total\n", g_region_count, total / (1024.0 * 1024.0));
-    if (allocate_region_bufs() != 0) return 1;
-
     thread_act_array_t acts;
     mach_msg_type_number_t n_acts;
     if (task_threads(mach_task_self(), &acts, &n_acts) != KERN_SUCCESS) {
@@ -279,11 +288,10 @@ int do_capture(const char* path) {
 
     printf("found %u threads\n", n_acts);
 
-    if (allocate_thread_buf(n_acts) != 0) { 
-        vm_deallocate(mach_task_self(), (vm_address_t)acts, sizeof(thread_act_t) * n_acts); 
-        return 1; 
-    }
-
+    /* Freeze every peer BEFORE looking at memory at all: classify_regions()
+     * and allocate_region_bufs() below need a quiesced process, not one
+     * where a peer can still mmap/munmap/mprotect underneath them between
+     * being classified and being memcpy'd. */
     mach_port_t main_port = mach_thread_self();
     for (mach_msg_type_number_t i = 0; i < n_acts; i++) {
         if (acts[i] == main_port) {
@@ -292,10 +300,36 @@ int do_capture(const char* path) {
         }
         if (thread_suspend(acts[i]) != KERN_SUCCESS) {
             fprintf(stderr, "thread_suspend failed for thread[%u]\n", i);
+            resume_threads(acts, i, main_port); /* only what's actually suspended so far */
             vm_deallocate(mach_task_self(), (vm_address_t)acts, sizeof(thread_act_t) * n_acts);
             return 1;
         }
         printf("suspended thread[%u] port=0x%x\n", i, acts[i]);
+    }
+
+    if (classify_regions() != 0) {
+        resume_threads(acts, n_acts, main_port);
+        vm_deallocate(mach_task_self(), (vm_address_t)acts, sizeof(thread_act_t) * n_acts);
+        return 1;
+    }
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < g_region_count; i++) {
+        total += g_regions[i].len;
+        printf("  region[%u] [0x%llx,0x%llx) %.2fMB prot=%u\n", i,
+               (uint64_t)g_regions[i].addr,
+               (uint64_t)(g_regions[i].addr + g_regions[i].len),
+               g_regions[i].len / (1024.0 * 1024.0), g_regions[i].protection);
+    }
+    printf("classified %u regions, %.2f MB total\n", g_region_count, total / (1024.0 * 1024.0));
+    if (allocate_region_bufs() != 0) {
+        resume_threads(acts, n_acts, main_port);
+        vm_deallocate(mach_task_self(), (vm_address_t)acts, sizeof(thread_act_t) * n_acts);
+        return 1;
+    }
+
+    if (allocate_thread_buf(n_acts) != 0) {
+        vm_deallocate(mach_task_self(), (vm_address_t)acts, sizeof(thread_act_t) * n_acts);
+        return 1;
     }
 
     for (mach_msg_type_number_t i = 0; i < n_acts; i++) {
@@ -305,11 +339,13 @@ int do_capture(const char* path) {
         mach_msg_type_number_t ncount = ARM_NEON_STATE64_COUNT;
         if (thread_get_state(acts[i], ARM_THREAD_STATE64, (thread_state_t)&td->regs.gregs, &gcount) != KERN_SUCCESS) {
             fprintf(stderr, "thread_get_state(GENERAL) failed for thread[%u]\n", i);
+            resume_threads(acts, n_acts, main_port);
             vm_deallocate(mach_task_self(), (vm_address_t)acts, sizeof(thread_act_t) * n_acts);
             return 1;
         }
         if (thread_get_state(acts[i], ARM_NEON_STATE64, (thread_state_t)&td->regs.neon, &ncount) != KERN_SUCCESS) {
             fprintf(stderr, "thread_get_state(NEON) failed for thread[%u]\n", i);
+            resume_threads(acts, n_acts, main_port);
             vm_deallocate(mach_task_self(), (vm_address_t)acts, sizeof(thread_act_t) * n_acts);
             return 1;
         }
@@ -340,6 +376,7 @@ int do_capture(const char* path) {
     FILE* f = fopen(path, "wb");
     if (!f) { perror("fopen"); free_region_bufs(); return 1; }
     checkpoint_header_t hdr = {
+        .thread_count = n_acts,
         .region_count = g_region_count,
         .capture_used = total,
         .munge = g_munge,
@@ -358,16 +395,7 @@ int do_capture(const char* path) {
     free_region_bufs();
     free_thread_buf(n_acts);
 
-    for (mach_msg_type_number_t i = 0; i < n_acts; i++) {
-        if (acts[i] == main_port) continue;
-        if (thread_resume(acts[i]) != KERN_SUCCESS) {
-            fprintf(stderr, "thread_resume failed for thread[%u]\n", i);
-            vm_deallocate(mach_task_self(), (vm_address_t)acts, sizeof(thread_act_t) * n_acts);
-            return 1;
-        }
-        printf("resumed thread[%u] port=0x%x\n", i, acts[i]);
-    }
-
+    resume_threads(acts, n_acts, main_port);
     vm_deallocate(mach_task_self(), (vm_address_t)acts, sizeof(thread_act_t) * n_acts);
 
     return 0;

@@ -272,6 +272,39 @@ static pid_t find_or_launch_daemon(void) {
 }
 
 /* Resume every non-main thread in acts[0, count) */
+static const char* run_state_name(integer_t run_state) {
+    switch (run_state) {
+        case TH_STATE_RUNNING:         return "RUNNING";
+        case TH_STATE_STOPPED:         return "STOPPED";
+        case TH_STATE_WAITING:         return "WAITING (interruptible)";
+        case TH_STATE_UNINTERRUPTIBLE: return "UNINTERRUPTIBLE";
+        case TH_STATE_HALTED:          return "HALTED";
+        default:                       return "unknown";
+    }
+}
+
+/* Diagnostic only -- log what a peer was actually doing at the moment we
+ * froze it. THREAD_BASIC_INFO's run_state distinguishes a plain
+ * interruptible wait (e.g. mid-nanosleep, can still take a signal) from
+ * an uninterruptible one (can't be kicked out by anything except
+ * whatever it's actually waiting for) -- relevant to whether thread_resume()
+ * alone is enough to let a peer's own blocking call eventually complete.
+ *
+ * TODO: confirmed WAITING (interruptible, e.g. mid-nanosleep) correctly
+ * waits out its remaining time once resumed -- UNINTERRUPTIBLE and the
+ * other states aren't handled specially at all yet, just logged. Decide
+ * what (if anything) needs to happen differently for those before this
+ * is more than a diagnostic. */
+static void log_thread_run_state(uint32_t i, mach_port_t port) {
+    struct thread_basic_info info;
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    if (thread_info(port, THREAD_BASIC_INFO, (thread_info_t)&info, &count) != KERN_SUCCESS) {
+        fprintf(stderr, "  thread_info failed for thread[%u]\n", i);
+        return;
+    }
+    printf("  thread[%u] run_state=%s sleep_time=%ds\n", i, run_state_name(info.run_state), info.sleep_time);
+}
+
 static void resume_threads(thread_act_array_t acts, mach_msg_type_number_t count, mach_port_t main_port) {
     for (mach_msg_type_number_t i = 0; i < count; i++) {
         if (acts[i] == main_port) continue;
@@ -323,6 +356,7 @@ int do_capture(const char* path) {
             return 1;
         }
         printf("suspended thread[%u] port=0x%x\n", i, acts[i]);
+        log_thread_run_state(i, acts[i]);
     }
 
     if (classify_regions() != 0) {

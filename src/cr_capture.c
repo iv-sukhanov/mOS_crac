@@ -35,15 +35,21 @@
 #include <errno.h>
 #include <mach/mach_vm.h>
 #include <mach/mach.h>
+#include <mach/thread_info.h>
 #include <libproc.h>
 #include <sys/param.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <spawn.h>
 
+/* tests/ convention: referenced relatively, same as crac_daemon.c from
+ * src/Makefile -- see this project's CLAUDE.md on that split. */
+#include "../tests/barrier_woa.h"
+
 extern char **environ;
 
 #define CRAC_DAEMON_PIDFILE "/tmp/crac_daemon.pid"
+#define TRAMP_STACK_SIZE (16 * 1024) /* capture_tpidr_trampoline() does almost nothing */
 
 /* TODO: task_threads()'s own out-of-line `acts` array (do_capture()) has
  * to exist before classify_regions() runs (needed to suspend everyone
@@ -60,6 +66,9 @@ static uint32_t      g_region_count;
 static uint64_t      g_munge;
 static void*         g_threads;
 static uint32_t      g_main_th_ind;
+static barrier_woa_t g_thread_barrier; /* must be a global -- capture_tpidr_trampoline()
+                                          runs as a separate hijacked thread, no access
+                                          to do_capture()'s own locals */
 
 /* --- region classification --- */
 
@@ -171,6 +180,15 @@ static void capture_state(int sig, siginfo_t* info, void* ctx) {
     for (uint32_t i = 0; i < g_region_count; i++) {
         memcpy(g_region_bufs[i], (void*)(uintptr_t)g_regions[i].addr, g_regions[i].len);
     }
+}
+
+static void capture_tpidr_trampoline() {
+    uint64_t idx;
+    __asm__ volatile ("mov %x0, x1" : "=r"(idx));
+    thread_desc_t* td = &((thread_desc_t*)g_threads)[idx];
+    __asm__ volatile ("mrs %0, tpidr_el0" : "=r" (td->regs.tpidr));
+    barrier_wait(&g_thread_barrier);
+    thread_suspend(mach_thread_self());
 }
 
 /* --- crac_daemon lookup/launch, see its own file header --- */
@@ -349,12 +367,79 @@ int do_capture(const char* path) {
             vm_deallocate(mach_task_self(), (vm_address_t)acts, sizeof(thread_act_t) * n_acts);
             return 1;
         }
-        td->regs.tpidr = 0; /* TODO: add tpidr */
         td->pthread_addr = (uint64_t)(uintptr_t)pthread_from_mach_thread_np(acts[i]);
-        printf("thread[%u] port=0x%x pthread_addr=0x%llx pc=0x%llx sp=0x%llx\n", 
-            i, acts[i], (uint64_t)td->pthread_addr, 
-            (uint64_t)arm_thread_state64_get_pc_fptr(td->regs.gregs), 
+        printf("thread[%u] port=0x%x pthread_addr=0x%llx pc=0x%llx sp=0x%llx\n",
+            i, acts[i], (uint64_t)td->pthread_addr,
+            (uint64_t)arm_thread_state64_get_pc_fptr(td->regs.gregs),
             (uint64_t)arm_thread_state64_get_sp(td->regs.gregs));
+    }
+
+    barrier_create(&g_thread_barrier, n_acts);
+
+    void* stacks[MAX_REGIONS] = {0};
+    for (mach_msg_type_number_t i = 0; i < n_acts; i++) {
+        if (acts[i] == main_port) continue;
+
+        stacks[i] = mmap(NULL, TRAMP_STACK_SIZE, PROT_READ | PROT_WRITE,
+                          MAP_ANON | MAP_PRIVATE, -1, 0);
+        if (stacks[i] == MAP_FAILED) {
+            fprintf(stderr, "mmap failed for thread[%u]'s trampoline stack: %s\n", i, strerror(errno));
+            resume_threads(acts, n_acts, main_port);
+            vm_deallocate(mach_task_self(), (vm_address_t)acts, sizeof(thread_act_t) * n_acts);
+            return 1;
+        }
+
+        thread_desc_t* td = &((thread_desc_t*)g_threads)[i];
+        arm_thread_state64_t hijack = td->regs.gregs; /* base: keep whatever flags etc. thread_get_state reported */
+        arm_thread_state64_set_pc_fptr(hijack, (void*)capture_tpidr_trampoline);
+        arm_thread_state64_set_sp(hijack, (void*)((uintptr_t)stacks[i] + TRAMP_STACK_SIZE));
+        hijack.__x[1] = i; /* not x0 -- see capture_tpidr_trampoline()'s own comment */
+
+        mach_msg_type_number_t gcount = ARM_THREAD_STATE64_COUNT;
+        if (thread_set_state(acts[i], ARM_THREAD_STATE64, (thread_state_t)&hijack, gcount) != KERN_SUCCESS) {
+            fprintf(stderr, "thread_set_state(hijack) failed for thread[%u]\n", i);
+            resume_threads(acts, n_acts, main_port);
+            vm_deallocate(mach_task_self(), (vm_address_t)acts, sizeof(thread_act_t) * n_acts);
+            return 1;
+        }
+        if (thread_resume(acts[i]) != KERN_SUCCESS) {
+            fprintf(stderr, "thread_resume(hijack) failed for thread[%u]\n", i);
+            resume_threads(acts, n_acts, main_port);
+            vm_deallocate(mach_task_self(), (vm_address_t)acts, sizeof(thread_act_t) * n_acts);
+            return 1;
+        }
+    }
+
+    barrier_wait(&g_thread_barrier); /* main's own arrival */
+
+    for (mach_msg_type_number_t i = 0; i < n_acts; i++) {
+        if (acts[i] == main_port) continue;
+
+        /* barrier_wait() returning only means the peer REACHED the
+         * barrier, not that it has actually self-suspended yet -- poll
+         * Mach's own suspend count rather than assume the ordering. */
+        for (;;) {
+            struct thread_basic_info info;
+            mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+            if (thread_info(acts[i], THREAD_BASIC_INFO, (thread_info_t)&info, &count) != KERN_SUCCESS) {
+                fprintf(stderr, "thread_info failed for thread[%u]\n", i);
+                resume_threads(acts, n_acts, main_port);
+                vm_deallocate(mach_task_self(), (vm_address_t)acts, sizeof(thread_act_t) * n_acts);
+                return 1;
+            }
+            if (info.suspend_count > 0) break;
+            usleep(200);
+        }
+
+        thread_desc_t* td = &((thread_desc_t*)g_threads)[i];
+        mach_msg_type_number_t gcount = ARM_THREAD_STATE64_COUNT;
+        if (thread_set_state(acts[i], ARM_THREAD_STATE64, (thread_state_t)&td->regs.gregs, gcount) != KERN_SUCCESS) {
+            fprintf(stderr, "thread_set_state(restore) failed for thread[%u]\n", i);
+            resume_threads(acts, n_acts, main_port);
+            vm_deallocate(mach_task_self(), (vm_address_t)acts, sizeof(thread_act_t) * n_acts);
+            return 1;
+        }
+        munmap(stacks[i], TRAMP_STACK_SIZE);
     }
 
     raise(SIGUSR1); /* synchronous: handler runs here, then execution continues below */

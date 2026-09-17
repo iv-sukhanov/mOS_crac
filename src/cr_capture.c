@@ -48,9 +48,9 @@ extern char **environ;
 static region_desc_t g_regions[MAX_REGIONS];
 static void*         g_region_bufs[MAX_REGIONS];
 static uint32_t      g_region_count;
-static regs_t        g_regs;
-static uint64_t      g_pthread_addr;
 static uint64_t      g_munge;
+static void*         g_threads;
+static uint32_t      g_main_th_ind;
 
 /* --- region classification --- */
 
@@ -105,6 +105,17 @@ static int classify_regions(void) {
     return 0;
 }
 
+static int allocate_thread_buf(uint32_t thread_count) {
+    g_threads = mmap(NULL, thread_count * sizeof(thread_desc_t),
+                     PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (g_threads == MAP_FAILED) {
+        fprintf(stderr, "mmap failed for thread buffer (%llu bytes): %s\n",
+                (uint64_t)(thread_count * sizeof(thread_desc_t)), strerror(errno));
+        return 1;
+    }
+    return 0;
+}
+
 /* mmap, not malloc -- see file header. */
 static int allocate_region_bufs(void) {
     for (uint32_t i = 0; i < g_region_count; i++) {
@@ -121,6 +132,13 @@ static int allocate_region_bufs(void) {
 }
 
 /* do_capture() may run more than once per process; don't leak the buffers. */
+static void free_thread_buf(uint32_t thread_count) {
+    if (g_threads) {
+        munmap(g_threads, thread_count * sizeof(thread_desc_t));
+        g_threads = NULL;
+    }
+}
+
 static void free_region_bufs(void) {
     for (uint32_t i = 0; i < g_region_count; i++) {
         if (g_region_bufs[i]) {
@@ -133,12 +151,13 @@ static void free_region_bufs(void) {
 /* Snapshot registers, then memcpy each already-classified region. */
 static void capture_state(int sig, siginfo_t* info, void* ctx) {
     (void)sig; (void)info;
-    g_regs.gregs = ((ucontext_t*)ctx)->uc_mcontext->__ss;
-    g_regs.neon  = ((ucontext_t*)ctx)->uc_mcontext->__ns;
-    __asm__ volatile ("mrs %0, tpidr_el0" : "=r" (g_regs.tpidr));
-    g_pthread_addr = (uint64_t)(uintptr_t)pthread_self();
-    uintptr_t stored_sig = *(uintptr_t *)(uintptr_t)g_pthread_addr;
-    g_munge = stored_sig ^ sign_for_addr((uintptr_t)g_pthread_addr);
+    thread_desc_t* td = &((thread_desc_t*)g_threads)[g_main_th_ind];
+    td->regs.gregs = ((ucontext_t*)ctx)->uc_mcontext->__ss;
+    td->regs.neon  = ((ucontext_t*)ctx)->uc_mcontext->__ns;
+    __asm__ volatile ("mrs %0, tpidr_el0" : "=r" (td->regs.tpidr));
+    td->pthread_addr = (uint64_t)(uintptr_t)pthread_self();
+    uintptr_t stored_sig = *(uintptr_t *)(uintptr_t)td->pthread_addr;
+    g_munge = stored_sig ^ sign_for_addr((uintptr_t)td->pthread_addr);
 
     for (uint32_t i = 0; i < g_region_count; i++) {
         memcpy(g_region_bufs[i], (void*)(uintptr_t)g_regions[i].addr, g_regions[i].len);
@@ -249,8 +268,58 @@ int do_capture(const char* path) {
                g_regions[i].len / (1024.0 * 1024.0), g_regions[i].protection);
     }
     printf("classified %u regions, %.2f MB total\n", g_region_count, total / (1024.0 * 1024.0));
-
     if (allocate_region_bufs() != 0) return 1;
+
+    thread_act_array_t acts;
+    mach_msg_type_number_t n_acts;
+    if (task_threads(mach_task_self(), &acts, &n_acts) != KERN_SUCCESS) {
+        fprintf(stderr, "task_threads failed\n");
+        return 1;
+    }
+
+    printf("found %u threads\n", n_acts);
+
+    if (allocate_thread_buf(n_acts) != 0) { 
+        vm_deallocate(mach_task_self(), (vm_address_t)acts, sizeof(thread_act_t) * n_acts); 
+        return 1; 
+    }
+
+    mach_port_t main_port = mach_thread_self();
+    for (mach_msg_type_number_t i = 0; i < n_acts; i++) {
+        if (acts[i] == main_port) {
+            g_main_th_ind = i;
+            continue;
+        }
+        if (thread_suspend(acts[i]) != KERN_SUCCESS) {
+            fprintf(stderr, "thread_suspend failed for thread[%u]\n", i);
+            vm_deallocate(mach_task_self(), (vm_address_t)acts, sizeof(thread_act_t) * n_acts);
+            return 1;
+        }
+        printf("suspended thread[%u] port=0x%x\n", i, acts[i]);
+    }
+
+    for (mach_msg_type_number_t i = 0; i < n_acts; i++) {
+        if (acts[i] == main_port) continue;
+        thread_desc_t* td = &((thread_desc_t*)g_threads)[i];
+        mach_msg_type_number_t gcount = ARM_THREAD_STATE64_COUNT;
+        mach_msg_type_number_t ncount = ARM_NEON_STATE64_COUNT;
+        if (thread_get_state(acts[i], ARM_THREAD_STATE64, (thread_state_t)&td->regs.gregs, &gcount) != KERN_SUCCESS) {
+            fprintf(stderr, "thread_get_state(GENERAL) failed for thread[%u]\n", i);
+            vm_deallocate(mach_task_self(), (vm_address_t)acts, sizeof(thread_act_t) * n_acts);
+            return 1;
+        }
+        if (thread_get_state(acts[i], ARM_NEON_STATE64, (thread_state_t)&td->regs.neon, &ncount) != KERN_SUCCESS) {
+            fprintf(stderr, "thread_get_state(NEON) failed for thread[%u]\n", i);
+            vm_deallocate(mach_task_self(), (vm_address_t)acts, sizeof(thread_act_t) * n_acts);
+            return 1;
+        }
+        td->regs.tpidr = 0; /* TODO: add tpidr */
+        td->pthread_addr = (uint64_t)(uintptr_t)pthread_from_mach_thread_np(acts[i]);
+        printf("thread[%u] port=0x%x pthread_addr=0x%llx pc=0x%llx sp=0x%llx\n", 
+            i, acts[i], (uint64_t)td->pthread_addr, 
+            (uint64_t)arm_thread_state64_get_pc_fptr(td->regs.gregs), 
+            (uint64_t)arm_thread_state64_get_sp(td->regs.gregs));
+    }
 
     raise(SIGUSR1); /* synchronous: handler runs here, then execution continues below */
 
@@ -260,33 +329,46 @@ int do_capture(const char* path) {
         return 0;
     }
 
-    /* pc/sp are opaque on arm64e -- use the accessor macros, not raw fields. */
-    printf("captured %u regions, %.2f MB, pc=%p sp=%p tpidr=0x%llx pthread_addr=0x%llx munge=0x%llx daemon_pid=%d\n",
-           g_region_count, total / (1024.0 * 1024.0),
-           arm_thread_state64_get_pc_fptr(g_regs.gregs),
-           (void*)arm_thread_state64_get_sp(g_regs.gregs),
-           (uint64_t)g_regs.tpidr, (uint64_t)g_pthread_addr, (uint64_t)g_munge,
-           (int)daemon_pid);
+    printf("captured %u regions, %.2f MB\n", g_region_count, total / (1024.0 * 1024.0));
+
+    thread_desc_t *td = &((thread_desc_t*)g_threads)[g_main_th_ind];
+    printf("main thread port=0x%x pthread_addr=0x%llx pc=0x%llx sp=0x%llx\n", 
+        main_port, (uint64_t)td->pthread_addr, 
+        (uint64_t)arm_thread_state64_get_pc_fptr(td->regs.gregs), 
+        (uint64_t)arm_thread_state64_get_sp(td->regs.gregs));
 
     FILE* f = fopen(path, "wb");
     if (!f) { perror("fopen"); free_region_bufs(); return 1; }
     checkpoint_header_t hdr = {
         .region_count = g_region_count,
         .capture_used = total,
-        .regs = g_regs,
-        .pthread_addr = g_pthread_addr,
         .munge = g_munge,
         .sentinel = sentinel,
         .daemon_pid = (int32_t)daemon_pid,
     };
     fwrite(&hdr, sizeof(hdr), 1, f);
+    fwrite(g_threads, sizeof(thread_desc_t), n_acts, f);
     fwrite(g_regions, sizeof(region_desc_t), g_region_count, f);
     for (uint32_t i = 0; i < g_region_count; i++) {
         fwrite(g_region_bufs[i], 1, g_regions[i].len, f);
     }
     fclose(f);
-    printf("checkpoint written to %s (pthread_addr=0x%llx)\n", path, (uint64_t)g_pthread_addr);
+    printf("checkpoint written to %s\n", path);
 
     free_region_bufs();
+    free_thread_buf(n_acts);
+
+    for (mach_msg_type_number_t i = 0; i < n_acts; i++) {
+        if (acts[i] == main_port) continue;
+        if (thread_resume(acts[i]) != KERN_SUCCESS) {
+            fprintf(stderr, "thread_resume failed for thread[%u]\n", i);
+            vm_deallocate(mach_task_self(), (vm_address_t)acts, sizeof(thread_act_t) * n_acts);
+            return 1;
+        }
+        printf("resumed thread[%u] port=0x%x\n", i, acts[i]);
+    }
+
+    vm_deallocate(mach_task_self(), (vm_address_t)acts, sizeof(thread_act_t) * n_acts);
+
     return 0;
 }

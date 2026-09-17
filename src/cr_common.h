@@ -36,19 +36,20 @@ typedef struct {
 } region_desc_t;
 
 typedef struct {
+    regs_t   regs;
+    uint64_t pthread_addr;
+} thread_desc_t;
+
+/* On-disk layout: this header, then thread_desc_t[thread_count], then
+ * region_desc_t[region_count], then the flat capture buffer
+ * (capture_used bytes). */
+typedef struct {
+    uint32_t thread_count;
     uint32_t region_count;
     uint64_t capture_used;  // total bytes across all regions
-    regs_t   regs;
-    uint64_t pthread_addr;  /* capturing thread's own pthread_self() at signal time */
-    uint64_t munge;         /* capturing process's live pthread munge (stored_sig XOR
-                               sign_for_addr(pthread_addr)) -- restore re-signs the
-                               worker struct with this after the cache-region remap
-                               overwrites the live munge global. */
-    uint64_t sentinel;      /* address of a do_capture() stack local; restore pokes a
-                               1 there before resuming so a re-entered do_capture()
-                               skips writing a checkpoint again. */
-    int32_t  daemon_pid;    /* crac_daemon pid alive at capture time, -1 if none --
-                               diagnostic only, restore proceeds either way. */
+    uint64_t munge;         // capturing process's live pthread munge
+    uint64_t sentinel;
+    int32_t  daemon_pid;    // crac_daemon pid alive at capture time
 } checkpoint_header_t;
 
 /* Same (addr, key, discriminator) triple as libpthread's own signature

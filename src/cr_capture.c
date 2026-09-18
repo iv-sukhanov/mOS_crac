@@ -365,10 +365,12 @@ int do_capture(const char* path) {
     uint64_t total = 0;
     for (uint32_t i = 0; i < g_region_count; i++) {
         total += g_regions[i].len;
+#ifdef DEBUG
         printf("  region[%u] [0x%llx,0x%llx) %.2fMB prot=%u\n", i,
                (uint64_t)g_regions[i].addr,
                (uint64_t)(g_regions[i].addr + g_regions[i].len),
                g_regions[i].len / (1024.0 * 1024.0), g_regions[i].protection);
+#endif
     }
     printf("classified %u regions, %.2f MB total\n", g_region_count, total / (1024.0 * 1024.0));
     if (allocate_region_bufs() != 0) {

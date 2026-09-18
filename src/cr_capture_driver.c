@@ -11,7 +11,11 @@
 
 void* second_thread_fn(void* arg) {
         (void)arg;
-        for (;;) sleep(1);
+        sleep(1);
+        for (int i = 0; i < 5; i++) {
+                printf("second thread: %d\n", i);
+        }
+        printf("second thread: exiting normally\n");
         return NULL;
     }
 
@@ -24,6 +28,42 @@ int main(int argc, char** argv) {
         perror("pthread_create");
         return 1;
     }
+
+    mach_port_t main_port = pthread_mach_thread_np(pthread_self());
+    mach_port_t second_port = pthread_mach_thread_np(second_thread);
+    printf("main thread: main port=0x%x, second thread port=0x%x\n", main_port, second_port);
     
-    return do_capture(argv[1]);
+    int rc = do_capture(argv[1]);
+
+    printf("do_capture returned %d\n", rc);
+
+    if (rc != 0) {
+        fprintf(stderr, "do_capture failed: %d\n", rc);
+        return rc;
+    }
+
+    main_port = pthread_mach_thread_np(pthread_self());
+    second_port = pthread_mach_thread_np(second_thread);
+    printf("main thread: after do_capture: main port=0x%x, second thread port=0x%x\n", main_port, second_port);
+
+    thread_act_array_t acts;
+    mach_msg_type_number_t n_acts;
+    if (task_threads(mach_task_self(), &acts, &n_acts) != KERN_SUCCESS) {
+        fprintf(stderr, "task_threads failed\n");
+        return 1;
+    }
+
+    for (mach_msg_type_number_t i = 0; i < n_acts; i++) {
+        pthread_t worker_pt = pthread_from_mach_thread_np(acts[i]);
+        uint64_t tid;
+        pthread_threadid_np(worker_pt, &tid);
+        printf("  thread[%u] pthread=%p port=0x%x tid=%llu\n", i, (void*)(intptr_t)worker_pt, acts[i], tid);
+    }
+
+    sleep(5);
+
+    printf("main thread: waiting for second thread to exit\n");
+    pthread_join(second_thread, NULL);
+    printf("main thread: exiting normally\n");
+    return 0;
 }

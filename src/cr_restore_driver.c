@@ -13,5 +13,8 @@
 int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) { fprintf(stderr, "usage: %s <file>\n", argv[0]); return 2; }
+    printf("sleeping 1s\n");
+    sleep(1);
+    printf("waking up\n");
     return do_restore(argv[1]);
 }

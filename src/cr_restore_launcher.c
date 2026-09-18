@@ -200,6 +200,12 @@ static int read_ckpt_regions(const char* ckpt_file, region_desc_t* regions, uint
         return -1;
     }
 
+    if (fseek(f, hdr.thread_count * sizeof(thread_desc_t), SEEK_CUR) != 0) {
+        perror("fseek");
+        fclose(f);
+        return -1;
+    }
+
     if (fread(regions, sizeof(region_desc_t), hdr.region_count, f) != hdr.region_count) {
         fprintf(stderr, "short read on region descriptors\n");
         fclose(f);

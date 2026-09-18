@@ -436,5 +436,21 @@
       "-o",
       "/dev/null"
     ]
+  },
+  {
+    "directory": "/Users/isukhanov/repos/mos_crac/tests",
+    "file": "checkpoint_reader.c",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Wall",
+      "-Wextra",
+      "-arch",
+      "arm64e",
+      "-c",
+      "checkpoint_reader.c",
+      "-o",
+      "/dev/null"
+    ]
   }
 ]

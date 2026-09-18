@@ -11,7 +11,7 @@
 
 void* second_thread_fn(void* arg) {
         (void)arg;
-        for (;;) sleep(30);
+        for (;;) sleep(1);
         return NULL;
     }
 

@@ -51,13 +51,6 @@ cr-restore: $(BINDIR)/cr_restore_driver $(BINDIR)/cr_restore_launcher
 
 cr-run: cr-capture cr-restore
 
-# Builds every binary this Makefile knows how to build, nothing run --
-# `bear -- make compile-all` regenerates compile_commands.json with every
-# source file in one pass, instead of only whichever subset a partial
-# build (e.g. `make build/cr_capture.o`) happened to touch last. -k: keep
-# going past one target's build failure (e.g. cr_restore.c mid-refactor)
-# so every OTHER file still gets compiled and captured too, instead of
-# plain make's default of stopping the whole build at the first error.
 compile-all:
 	$(MAKE) -k $(BINDIR)/cr_capture_driver $(BINDIR)/cr_restore_driver $(BINDIR)/cr_restore_launcher $(BINDIR)/crac_daemon
 

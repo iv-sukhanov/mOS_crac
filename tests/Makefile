@@ -9,7 +9,7 @@ RETRY_NUMBER ?= 1
 $(BINDIR)/%: %.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello freestanding-spin resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign thread-capture thread-restore thread-run cache-cow-probe reserve-probe full-run-reserved lr-sign-probe ucontext-reg-sign thread-state-resign region-reserver-probe
+.PHONY: checkpoint restore run clean sweep-pc-page capture resume resume-noaslr run-noaslr freestanding-hello freestanding-spin resume-noaslr-retry run-noaslr-retry full-capture bsdthread-munge-selfsign thread-capture thread-restore thread-run cache-cow-probe reserve-probe full-run-reserved lr-sign-probe ucontext-reg-sign thread-state-resign region-reserver-probe inspect-checkpoint
 
 checkpoint: $(BINDIR)/sim_checkpoint_test
 	$(BINDIR)/sim_checkpoint_test checkpoint $(CKPT_FILE)
@@ -235,6 +235,13 @@ ucontext-reg-sign: ucontext_reg_sign_test.c
 thread-state-resign: thread_state_resign_test.c
 	$(CC) $(CFLAGS) -arch arm64e -o $(BINDIR)/thread_state_resign_test thread_state_resign_test.c
 	$(BINDIR)/thread_state_resign_test
+
+# Dumps a cr_capture checkpoint's header/thread/region metadata (no region
+# bytes) for a sanity look before restoring -- see checkpoint_reader.c.
+# Needs -arch arm64e like every file that includes src/cr_common.h.
+inspect-checkpoint: checkpoint_reader.c ../src/cr_common.h
+	$(CC) $(CFLAGS) -arch arm64e -o $(BINDIR)/checkpoint_reader checkpoint_reader.c
+	$(BINDIR)/checkpoint_reader $(CKPT_FILE)
 
 clean:
 	rm -f $(CKPT_FILE)

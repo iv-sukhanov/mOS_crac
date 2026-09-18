@@ -64,7 +64,6 @@
 extern void *__bsdthread_create(void *func, void *func_arg, void *stack,
                                  void *pthread, uint32_t flags);
 
-static regs_t        g_regs;
 static region_desc_t g_regions[MAX_REGIONS];
 static uint8_t*      g_restore_buf;
 static uint64_t      g_region_off[MAX_REGIONS];
@@ -245,7 +244,7 @@ int do_restore(const char* path) {
         fprintf(stderr, "short read on capture buffer\n"); fclose(f); return 1;
     }
     fclose(f);
-    g_regs = hdr.regs;
+    // g_regs = hdr.regs;
 
     printf("read %u regions, %.2f MB, pthread_addr=0x%llx munge=0x%llx sentinel=0x%llx daemon_pid=%d\n",
            hdr.region_count, hdr.capture_used / (1024.0 * 1024.0),

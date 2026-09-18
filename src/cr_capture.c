@@ -64,7 +64,7 @@ static region_desc_t g_regions[MAX_REGIONS];
 static void*         g_region_bufs[MAX_REGIONS];
 static uint32_t      g_region_count;
 static uint64_t      g_munge;
-static void*         g_threads;
+static void*         g_threads; // TODO: change type to thread_desc_t*
 static uint32_t      g_main_th_ind;
 static barrier_woa_t g_thread_barrier; /* must be a global -- capture_tpidr_trampoline()
                                           runs as a separate hijacked thread, no access
@@ -410,7 +410,7 @@ int do_capture(const char* path) {
 
     barrier_create(&g_thread_barrier, n_acts);
 
-    void* stacks[MAX_REGIONS] = {0};
+    void* stacks[MAX_REGIONS] = {0}; // TODO: get rid of hard-coded limit
     for (mach_msg_type_number_t i = 0; i < n_acts; i++) {
         if (acts[i] == main_port) continue;
 

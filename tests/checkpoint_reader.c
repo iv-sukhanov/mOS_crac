@@ -50,10 +50,11 @@ int main(int argc, char** argv) {
     printf("== threads (%u) ==\n", hdr.thread_count);
     for (uint32_t i = 0; i < hdr.thread_count; i++) {
         thread_desc_t* td = &threads[i];
-        printf("thread[%u] pthread_addr=0x%llx pc=0x%llx sp=0x%llx\n",
+        printf("thread[%u] pthread_addr=0x%llx pc=0x%llx sp=0x%llx tpidr_el0=0x%llx\n",
             i, td->pthread_addr,
             (uint64_t)arm_thread_state64_get_pc_fptr(td->regs.gregs),
-            (uint64_t)arm_thread_state64_get_sp(td->regs.gregs));
+            (uint64_t)arm_thread_state64_get_sp(td->regs.gregs),
+            td->regs.tpidr);
     }
 
     region_desc_t* regions = malloc(sizeof(region_desc_t) * hdr.region_count);

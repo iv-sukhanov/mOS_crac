@@ -11,6 +11,10 @@
 #include <mach/mach.h>
 #include <mach/task.h>
 #include <mach-o/dyld_images.h>
+#include <sys/mman.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
 
 uintptr_t sign_for_addr(uintptr_t addr) {
     return (uintptr_t)ptrauth_sign_unauthenticated(
@@ -40,4 +44,23 @@ bool in_shared_cache_range(mach_vm_address_t addr) {
     struct dyld_all_image_infos* infos = (struct dyld_all_image_infos*)(uintptr_t)info.all_image_info_addr;
     uint64_t base = (uint64_t)infos->sharedCacheBaseAddress;
     return base != 0 && (uint64_t)addr >= base && (uint64_t)addr < base + CACHE_SPAN_BYTES;
+}
+
+int alloc_thread_descs(uint32_t thread_count, thread_desc_t** out) {
+    *out = mmap(NULL, (size_t)thread_count * sizeof(thread_desc_t),
+                PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (*out == MAP_FAILED) {
+        fprintf(stderr, "mmap failed for thread buffer (%llu bytes): %s\n",
+                (unsigned long long)((size_t)thread_count * sizeof(thread_desc_t)), strerror(errno));
+        *out = NULL;
+        return 1;
+    }
+    return 0;
+}
+
+void free_thread_descs(thread_desc_t** out, uint32_t thread_count) {
+    if (*out) {
+        munmap(*out, (size_t)thread_count * sizeof(thread_desc_t));
+        *out = NULL;
+    }
 }

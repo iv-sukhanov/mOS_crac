@@ -123,15 +123,9 @@ static int classify_regions(void) {
     return 0;
 }
 
+/* Cast needed only because g_threads is still void* -- see its own TODO. */
 static int allocate_thread_buf(uint32_t thread_count) {
-    g_threads = mmap(NULL, thread_count * sizeof(thread_desc_t),
-                     PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
-    if (g_threads == MAP_FAILED) {
-        fprintf(stderr, "mmap failed for thread buffer (%llu bytes): %s\n",
-                (uint64_t)(thread_count * sizeof(thread_desc_t)), strerror(errno));
-        return 1;
-    }
-    return 0;
+    return alloc_thread_descs(thread_count, (thread_desc_t**)&g_threads);
 }
 
 /* mmap, not malloc -- see file header. */
@@ -151,10 +145,7 @@ static int allocate_region_bufs(void) {
 
 /* do_capture() may run more than once per process; don't leak the buffers. */
 static void free_thread_buf(uint32_t thread_count) {
-    if (g_threads) {
-        munmap(g_threads, thread_count * sizeof(thread_desc_t));
-        g_threads = NULL;
-    }
+    free_thread_descs((thread_desc_t**)&g_threads, thread_count);
 }
 
 static void free_region_bufs(void) {
@@ -182,6 +173,13 @@ static void capture_state(int sig, siginfo_t* info, void* ctx) {
     }
 }
 
+/* TODO: confirmed bug (2026-09-18, NOTES.md) -- a restored peer thread's
+ * td->regs.tpidr comes back 0x0, which can't be a live pthread's actual
+ * TSD pointer (TPIDR_EL0 is never legitimately zero for a running thread;
+ * the main thread's own tpidr, captured separately in capture_state(),
+ * comes back looking real). Not yet root-caused -- suspects: idx read
+ * before it's valid, or this mrs running too early/late relative to the
+ * thread's own real TPIDR_EL0 setup. */
 static void capture_tpidr_trampoline() {
     uint64_t idx;
     __asm__ volatile ("mov %x0, x1" : "=r"(idx));

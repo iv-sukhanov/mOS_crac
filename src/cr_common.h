@@ -61,6 +61,19 @@ uintptr_t sign_for_addr(uintptr_t addr);
 bool in_shared_cache_submap(mach_vm_address_t addr);
 bool in_shared_cache_range(mach_vm_address_t addr);
 
+/* The thread_desc_t[thread_count] buffer both sides need: capture fills it
+ * from thread_get_state()/capture_state() before writing it out; restore
+ * mmaps the same shape and fread()s the checkpoint file straight into it.
+ * mmap, not malloc, for the same "capture's own scratch allocations must
+ * not land inside a captured region" reasoning as cr_capture.c's per-region
+ * buffers -- restore doesn't checkpoint itself, but sharing one allocator
+ * means both sides can't drift. out is an out-param (not a return value) so
+ * a caller whose own global is still void* -- cr_capture.c's g_threads,
+ * pending its own switch to thread_desc_t* -- can pass its address cast to
+ * thread_desc_t**. */
+int alloc_thread_descs(uint32_t thread_count, thread_desc_t** out);
+void free_thread_descs(thread_desc_t** out, uint32_t thread_count);
+
 /* The two public entry points -- one per driver binary. */
 int do_capture(const char* path);
 int do_restore(const char* path);

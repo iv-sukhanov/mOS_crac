@@ -2,7 +2,7 @@
 
 
 > Active development has moved to Azul's internal GitLab:
-> `gitlab.azulsystems.com/isukhanov/warp-macos` (VPN required). This GitHub
+> `gitlab.azulsystems.com/isukhanov/warp-macos`. This GitHub
 > copy is no longer the primary repo.
 
 Proof-of-concept macOS-native checkpoint/restore engine for OpenJDK's
